@@ -1,0 +1,18 @@
+.pio_version 1
+.program snes_capture_high
+; PIO GPIO base = 16
+; GPIO32-34 A21-A23       (in_base = GPIO32)
+; GPIO35    duplicate of /WR (jmp pin)
+; GPIO36    duplicate of PHI2
+;
+; WAIT PIN uses offsets from in_base, so pin 4 = GPIO36.
+
+.wrap_target
+    mov isr, null
+    wait 1 pin 4
+    wait 0 pin 4
+    in pins, 3
+    jmp pin no_write       ; GPIO35 high = not a write
+    push block
+no_write:
+.wrap

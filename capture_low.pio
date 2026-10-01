@@ -1,0 +1,21 @@
+.pio_version 1
+.program snes_capture_low
+; PIO GPIO base = 0
+; GPIO0     PHI2
+; GPIO1     /WR (jmp pin)
+; GPIO2-9   D0-D7
+; GPIO10-19 A0-A9
+; GPIO20    unused/dummy
+; GPIO21-31 A10-A20
+;
+; in_base = GPIO2.  IN PINS, 30 therefore samples GPIO2..GPIO31.
+
+.wrap_target
+    mov isr, null
+    wait 1 gpio 0
+    wait 0 gpio 0
+    in pins, 30
+    jmp pin no_write       ; /WR high = not a write
+    push block
+no_write:
+.wrap
