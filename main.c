@@ -1,6 +1,5 @@
 #include <stdio.h>
 #include <stdint.h>
-#include <inttypes.h>
 #include "pico/stdlib.h"
 #include "pico/stdio_usb.h"
 #include "hardware/gpio.h"
@@ -83,7 +82,7 @@ int main(void) {
     configure_input(PIN_WR_HI, true);
     configure_input(PIN_PHI2_HI, false);
 
-    printf("\n=== SNES RP2350B SIO SIGNAL DIAGNOSTIC v0.5 ===\n");
+    printf("\n=== SNES RP2350B SIO SIGNAL DIAGNOSTIC v0.5.2 ===\n");
     printf("This version DOES NOT use PIO or DMA. It only watches the raw GPIO pads.\n");
     printf("Expected: GP0=PHI2, GP1=/WR, GP36=PHI2 jumper copy, GP35=/WR jumper copy.\n");
     printf("Keep RP2350B powered before the SNES. Turn the SNES on now.\n\n");
@@ -97,7 +96,7 @@ int main(void) {
         double wr_low_pct_lo = d.samples ? (100.0 * d.wr_low_samples_lo / d.samples) : 0.0;
         double wr_low_pct_hi = d.samples ? (100.0 * d.wr_low_samples_hi / d.samples) : 0.0;
 
-        printf("#%" PRIu64 "  100ms samples=%lu\n", iter, (unsigned long)d.samples);
+        printf("#%llu  100ms samples=%lu\n", (unsigned long long)iter, (unsigned long)d.samples);
         printf(" PHI2: GP0 edges=%lu (%u->%u) | GP36 edges=%lu (%u->%u)\n",
                (unsigned long)d.phi2_edges_lo, d.start_phi2_lo, d.end_phi2_lo,
                (unsigned long)d.phi2_edges_hi, d.start_phi2_hi, d.end_phi2_hi);
