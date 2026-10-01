@@ -15,9 +15,8 @@
     wait 1 gpio 0
     wait 0 gpio 0
     in pins, 30
-    jmp pin no_write
+    jmp pin no_write       ; /WR high = not a write
     push block
-
 no_write:
-    nop
+    nop                 ; valid jump target before wrap
 .wrap

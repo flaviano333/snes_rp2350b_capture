@@ -1,3 +1,5 @@
+DIAGNOSTIC v0.2
+
 # SNES RP2350B Bus Capture v0.1
 
 Diagnostic firmware source for the SpotPear RP2350B-MINI-A used as a passive SNES cartridge-bus sniffer.
@@ -48,3 +50,6 @@ The resulting file is:
 The firmware enables USB CDC stdio. Open the serial port at any baud rate (USB CDC ignores the configured baud) and reset the board with the SNES OFF. It prints `READY`; then turn on the console. It records the first 64 write cycles using two PIO blocks plus DMA, then prints full 24-bit address and 8-bit data values.
 
 This is a diagnostic first version. It does not yet reconstruct writes performed through all SNES B-bus/WRAM mechanisms.
+
+## v0.1.1 build fix
+The `no_write` labels in both PIO programs now point to an actual `nop` instruction. This fixes the pioasm error `jmp target address ... is beyond the end of the program` seen in the initial v0.1 source.
