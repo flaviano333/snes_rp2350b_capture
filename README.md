@@ -1,4 +1,4 @@
-DIAGNOSTIC v0.2
+DIAGNOSTIC v0.4 INFINITE
 
 # SNES RP2350B Bus Capture v0.1
 
@@ -53,3 +53,12 @@ This is a diagnostic first version. It does not yet reconstruct writes performed
 
 ## v0.1.1 build fix
 The `no_write` labels in both PIO programs now point to an actual `nop` instruction. This fixes the pioasm error `jmp target address ... is beyond the end of the program` seen in the initial v0.1 source.
+
+
+## v0.3 diagnostic fix
+Routes the SNES input pads to their PIO instances with `pio_gpio_init()` and explicitly keeps all sampled pins input-only. This fixes v0.2 staying at LOW 0/64 HIGH 0/64 even though SIO could see the pins.
+
+
+## v0.4 infinite diagnostic mode
+
+Removes the 15-second capture timeout. The firmware now keeps printing a heartbeat every 500 ms and waits indefinitely until both PIO/DMA halves have captured all 64 write cycles. This version records one 64-write batch per boot; after printing the batch it remains idle so the SNES can be powered off safely.

@@ -15,7 +15,6 @@
 #define PIN_PHI2_HI    36
 
 #define SAMPLE_COUNT   64
-#define CAPTURE_TIMEOUT_MS 15000
 
 static uint32_t low_samples[SAMPLE_COUNT];
 static uint32_t high_samples[SAMPLE_COUNT];
@@ -57,7 +56,7 @@ int main(void) {
     }
     sleep_ms(250);
 
-    printf("\n=== SNES RP2350B bus capture DIAGNOSTIC v0.2 ===\n");
+    printf("\n=== SNES RP2350B bus capture DIAGNOSTIC v0.4 INFINITE ===\n");
     printf("USB serial connected. Keep the RP2350B powered before powering the SNES.\n");
     printf("Expected jumpers: GP0->GP36 (PHI2), GP1->GP35 (/WR).\n\n");
     fflush(stdout);
@@ -70,6 +69,17 @@ int main(void) {
     PIO pio_lo = pio0;
     const uint sm_lo = 0;
     int base_lo_rc = pio_set_gpio_base(pio_lo, 0);
+
+    // IMPORTANT: route the physical pads to PIO0. gpio_init() above leaves them
+    // on the SIO function; PIO cannot sample them until their function select
+    // is changed to this PIO instance. Keep every line input-only.
+    pio_gpio_init(pio_lo, PIN_PHI2);
+    pio_gpio_init(pio_lo, PIN_WR);
+    for (uint pin = 2; pin <= 19; ++pin) pio_gpio_init(pio_lo, pin);
+    for (uint pin = 21; pin <= 31; ++pin) pio_gpio_init(pio_lo, pin);
+    pio_sm_set_consecutive_pindirs(pio_lo, sm_lo, 0, 20, false);
+    pio_sm_set_consecutive_pindirs(pio_lo, sm_lo, 21, 11, false);
+
     uint off_lo = pio_add_program(pio_lo, &snes_capture_low_program);
     pio_sm_config c_lo = snes_capture_low_program_get_default_config(off_lo);
     sm_config_set_in_pins(&c_lo, PIN_DATA_BASE);
@@ -81,6 +91,11 @@ int main(void) {
     PIO pio_hi = pio1;
     const uint sm_hi = 0;
     int base_hi_rc = pio_set_gpio_base(pio_hi, 16);
+
+    // Route A21-A23 and the duplicated /WR + PHI2 lines to PIO1.
+    for (uint pin = 32; pin <= 36; ++pin) pio_gpio_init(pio_hi, pin);
+    pio_sm_set_consecutive_pindirs(pio_hi, sm_hi, 32, 5, false);
+
     uint off_hi = pio_add_program(pio_hi, &snes_capture_high_program);
     pio_sm_config c_hi = snes_capture_high_program_get_default_config(off_hi);
     sm_config_set_in_pins(&c_hi, 32);
@@ -89,6 +104,7 @@ int main(void) {
     sm_config_set_fifo_join(&c_hi, PIO_FIFO_JOIN_RX);
     int init_hi_rc = pio_sm_init(pio_hi, sm_hi, off_hi, &c_hi);
 
+    printf("PIO pads routed to PIO0/PIO1.\n");
     printf("PIO init: base_lo=%d init_lo=%d | base_hi=%d init_hi=%d\n",
            base_lo_rc, init_lo_rc, base_hi_rc, init_hi_rc);
     if (base_lo_rc || init_lo_rc || base_hi_rc || init_hi_rc) {
@@ -119,17 +135,20 @@ int main(void) {
     dma_channel_configure(dma_hi, &dc_hi, high_samples, &pio_hi->rxf[sm_hi], SAMPLE_COUNT, false);
 
     printf("READY. Turn the SNES on now.\n");
-    printf("I will print capture progress every 500 ms instead of hanging silently.\n\n");
+    printf("I will keep waiting indefinitely and print capture progress every 500 ms.\n\n");
     fflush(stdout);
 
     dma_start_channel_mask((1u << dma_lo) | (1u << dma_hi));
     pio_sm_set_enabled(pio_lo, sm_lo, true);
     pio_sm_set_enabled(pio_hi, sm_hi, true);
 
-    absolute_time_t start = get_absolute_time();
     uint32_t last_lo = SAMPLE_COUNT + 1;
     uint32_t last_hi = SAMPLE_COUNT + 1;
+    uint64_t heartbeat_count = 0;
 
+    // No timeout in v0.4. This loop waits forever until both halves have
+    // captured SAMPLE_COUNT write cycles. If the SNES is off or a signal is
+    // missing, the heartbeat continues indefinitely instead of aborting.
     while (true) {
         uint32_t rem_lo = dma_remaining(dma_lo);
         uint32_t rem_hi = dma_remaining(dma_hi);
@@ -143,7 +162,9 @@ int main(void) {
             last_lo = rem_lo;
             last_hi = rem_hi;
         } else {
-            printf("heartbeat: LOW %lu/%d   HIGH %lu/%d   /WR GP1=%d GP35=%d\n",
+            ++heartbeat_count;
+            printf("heartbeat #%llu: LOW %lu/%d   HIGH %lu/%d   /WR GP1=%d GP35=%d\n",
+                   (unsigned long long)heartbeat_count,
                    (unsigned long)(SAMPLE_COUNT - rem_lo), SAMPLE_COUNT,
                    (unsigned long)(SAMPLE_COUNT - rem_hi), SAMPLE_COUNT,
                    gpio_get(PIN_WR), gpio_get(PIN_WR_HI));
@@ -151,28 +172,6 @@ int main(void) {
         }
 
         if (rem_lo == 0 && rem_hi == 0) break;
-
-        if (absolute_time_diff_us(start, get_absolute_time()) >= (int64_t)CAPTURE_TIMEOUT_MS * 1000) {
-            printf("\nTIMEOUT after %d s.\n", CAPTURE_TIMEOUT_MS / 1000);
-            printf("LOW captured %lu/%d; HIGH captured %lu/%d.\n",
-                   (unsigned long)(SAMPLE_COUNT - rem_lo), SAMPLE_COUNT,
-                   (unsigned long)(SAMPLE_COUNT - rem_hi), SAMPLE_COUNT);
-            if (rem_lo < SAMPLE_COUNT && rem_hi == SAMPLE_COUNT) {
-                printf("Diagnosis: low-half capture works, high-half sees no writes. Check GP0->GP36 and GP1->GP35.\n");
-            } else if (rem_lo == SAMPLE_COUNT && rem_hi < SAMPLE_COUNT) {
-                printf("Diagnosis: high-half capture works, low-half sees no writes. Check PHI2 GP0 and /WR GP1.\n");
-            } else if (rem_lo == SAMPLE_COUNT && rem_hi == SAMPLE_COUNT) {
-                printf("Diagnosis: neither PIO captured a write. Check SNES power, PHI2, /WR, and common GND.\n");
-            } else {
-                printf("Both halves saw activity but did not finish equally. Send this status to me.\n");
-            }
-            fflush(stdout);
-            pio_sm_set_enabled(pio_lo, sm_lo, false);
-            pio_sm_set_enabled(pio_hi, sm_hi, false);
-            dma_channel_abort(dma_lo);
-            dma_channel_abort(dma_hi);
-            while (true) sleep_ms(1000);
-        }
 
         sleep_ms(500);
     }
@@ -199,6 +198,8 @@ int main(void) {
     }
     fflush(stdout);
 
-    printf("\nDone. Power the SNES off before disconnecting the RP2350B.\n");
+    printf("\nCapture complete. Power the SNES off before disconnecting the RP2350B.\n");
+    printf("This v0.4 waits indefinitely for a capture, but records one 64-write batch per boot.\n");
+    fflush(stdout);
     while (true) sleep_ms(1000);
 }
