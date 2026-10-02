@@ -93,7 +93,8 @@ typedef enum {
     DEBUG_WRAM,
     DEBUG_READ,
     DEBUG_WRITE,
-    DEBUG_WMDATA
+    DEBUG_WMDATA,
+    DEBUG_RAWREAD
 } debug_mode_t;
 
 static debug_mode_t debug_mode = DEBUG_OFF;
@@ -176,6 +177,7 @@ static const char *debug_mode_name(debug_mode_t mode) {
         case DEBUG_READ: return "READ";
         case DEBUG_WRITE: return "WRITE";
         case DEBUG_WMDATA: return "WMDATA";
+        case DEBUG_RAWREAD: return "RAWREAD";
         default: return "OFF";
     }
 }
@@ -200,6 +202,7 @@ static void maybe_debug_access(bool is_read, uint32_t address, uint8_t data,
         case DEBUG_READ: match = is_read; break;
         case DEBUG_WRITE: match = !is_read; break;
         case DEBUG_WMDATA: match = false; break;
+        case DEBUG_RAWREAD: match = false; break;
         default: break;
     }
     if (!match) return;
@@ -212,6 +215,27 @@ static void maybe_debug_access(bool is_read, uint32_t address, uint8_t data,
                direct ? "DIRECT" : "MIRROR");
     }
     printf("\n");
+    fflush(stdout);
+
+    --debug_remaining;
+    if (debug_remaining == 0) {
+        debug_mode = DEBUG_OFF;
+        printf("DEBUG DONE (auto-off)\n");
+        fflush(stdout);
+    }
+}
+
+static void maybe_debug_raw_read(uint16_t low16, uint32_t high17, uint8_t data, uint32_t reconstructed) {
+    if (debug_mode != DEBUG_RAWREAD || debug_remaining == 0) return;
+
+    // L is the raw state of GP10..GP17: bit0=GP10 ... bit7=GP17.
+    // H is the raw state of GP18..GP34: bit0=GP18 ... bit16=GP34.
+    // These are captured before logical A0..A23 remapping.  The PC-side mapper
+    // can therefore test alternate wiring permutations without reflashing.
+    uint8_t raw_l = (uint8_t)((low16 >> 8) & 0xffu);
+    printf("RAWREAD L=%02X H=%05lX D=%02X A=%06lX\n",
+           raw_l, (unsigned long)(high17 & 0x1ffffu), data,
+           (unsigned long)(reconstructed & 0xffffffu));
     fflush(stdout);
 
     --debug_remaining;
@@ -249,8 +273,9 @@ static void command_debug(char *args) {
     else if (!strcmp(mode, "READ")) new_mode = DEBUG_READ;
     else if (!strcmp(mode, "WRITE")) new_mode = DEBUG_WRITE;
     else if (!strcmp(mode, "WMDATA")) new_mode = DEBUG_WMDATA;
+    else if (!strcmp(mode, "RAWREAD")) new_mode = DEBUG_RAWREAD;
     else {
-        printf("ERR DEBUG expects OFF, ALL, WRAM, READ, WRITE or WMDATA\n");
+        printf("ERR DEBUG expects OFF, ALL, WRAM, READ, WRITE, WMDATA or RAWREAD\n");
         return;
     }
 
@@ -460,6 +485,7 @@ static void print_help(void) {
     printf("  DEBUG READ [N]          print next N reads\n");
     printf("  DEBUG WRITE [N]         print next N writes\n");
     printf("  DEBUG WMDATA [N]        print $2180-$2183 WRAM-port activity\n");
+    printf("  DEBUG RAWREAD [N]       print raw GP10-17/GP18-34 read samples for auto-mapper\n");
     printf("  DEBUG OFF               stop debug output\n");
     printf("  BANKS                   show per-bank read/write counters\n");
     printf("  WMSTATE                 show $2180-$2183 pointer/counters\n");
@@ -854,6 +880,7 @@ static void process_read_batch(void) {
         uint32_t high17 = unpack_high17(read_high_samples[i]);
         uint8_t data = (uint8_t)(low16 & 0xffu);
         uint32_t address = reconstruct_address(low16, high17) & 0xffffffu;
+        maybe_debug_raw_read(low16, high17, data, address);
         uint8_t bank = (uint8_t)(address >> 16);
 
         ++total_bus_reads;
@@ -889,14 +916,14 @@ int main(void) {
     memset(wram, 0, sizeof(wram));
     memset(wram_valid, 0, sizeof(wram_valid));
 
-    printf("\n=== SNES RP2350B RA Bridge Firmware v1.3 ATOMIC SNAPSHOT ===\n");
-    printf("Passive A-bus monitor with address remap + atomic multi-range RA snapshots.\n");
+    printf("\n=== SNES RP2350B RA Bridge Firmware v1.4 RAW ADDRESS MAPPER ===\n");
+    printf("Passive A-bus monitor with address remap + atomic RA snapshots + raw-address diagnostics.\n");
     printf("PHI2=GP0 /WR=GP1 /RD=GP35 D0-D7=GP2-9; address GPIO order is remapped in firmware.\n");
     printf("The 128 KiB mirror learns from direct/mirror WRAM traffic and CPU-side WMDATA accesses; unseen bytes remain UNKNOWN.\n");
     printf("Keep the RP2350B powered before powering the SNES.\n");
     printf("Measured map: A0=12 A1=11 A2=10 A3=13 A4=14 A5=16 A6=15 A7=17\n");
     printf("              A8=19 A9=21 A10=22 ... A22=34 A23=18 (GP20 skipped)\n");
-    printf("Type HELP for commands; SNAP is used by the v1.3 RA bridge for coherent reads.\n\n");
+    printf("Type HELP for commands; DEBUG RAWREAD is used by infer_address_map.py.\n\n");
     fflush(stdout);
 
     for (uint pin = 0; pin <= 35; ++pin) {
@@ -1005,7 +1032,7 @@ int main(void) {
     channel_config_set_write_increment(&dc_read_hi, true);
     channel_config_set_dreq(&dc_read_hi, pio_get_dreq(pio_hi, sm_read_hi, false));
 
-    printf("READY. Read+write capture runs quietly in the background (v1.3 atomic snapshot).\n");
+    printf("READY. Read+write capture runs quietly in the background (v1.4 raw mapper).\n");
     printf("Use INFO, BANKS, WMSTATE, DEBUG, READ, READSNES, HEX, DUMPBIN, RBIN or SNAP.\n\n");
     fflush(stdout);
 
