@@ -1,35 +1,39 @@
-# SNES RP2350B Capture v0.6 — no external synchronization jumpers
+# SNES RP2350B WRAM capture v0.7
 
-This diagnostic uses the RP2350 PIO v1 cross-PIO IRQ feature to synchronize PIO0 and PIO1 internally.
+Diagnostic/experimental firmware for the SpotPear RP2350B-MINI-A used as a passive SNES bus monitor.
 
 ## Wiring
 
-- GP0 = PHI2
-- GP1 = /WR
-- GP2..GP9 = D0..D7
-- GP10..GP19 = A0..A9
-- GP20 = not a SNES signal (dummy gap / onboard WS2812 pin)
-- GP21..GP34 = A10..A23
-- SNES GND = RP2350B GND
+- GP0  <- SNES PHI2
+- GP1  <- SNES /WR
+- GP2..GP9 <- D0..D7
+- GP10..GP19 <- A0..A9
+- GP20 is skipped
+- GP21..GP34 <- A10..A23
+- SNES GND -> RP2350B GND
 
-**No GP0→GP36 or GP1→GP35 jumper is used in v0.6. GP35 and GP36 can remain disconnected.**
+No GP35/GP36 jumpers are required.
 
-## How synchronization works
+## What v0.7 changes
 
-PIO0 sees GP0/GP1 and the low data/address pins. On a write cycle while PHI2 is high it executes `irq next 0`. On RP2350, from PIO0 this sets IRQ0 in PIO1. PIO1 is waiting on its own IRQ0, snapshots GP18..GP34, and pushes that high address sample. PIO0 then waits for PHI2 to fall and snapshots D0-D7 + A0-A7.
+This version keeps the v0.6 two-PIO capture design, but filters the output so only accesses that map to SNES WRAM are printed:
 
-The firmware uses DMA for both PIO RX FIFOs, reconstructs the 24-bit SNES address, prints 64 paired writes, then rearms automatically forever.
+- direct WRAM: `$7E:0000-$7F:FFFF`
+- WRAM mirrors: `$00-$3F:0000-$1FFF` and `$80-$BF:0000-$1FFF`
 
-## Build
+It also maintains a 128 KiB *partial* software mirror. Bytes are marked as known only after an observed write, because this passive A-bus prototype does not know the power-on WRAM contents and may not yet observe every possible path that can modify WRAM.
 
-Use the bundled GitHub Actions workflow (`Actions` → `Build UF2`), then download the artifact `snes-rp2350b-capture-uf2`.
+Output example:
 
-## Power-up order
+```
+WRAM $013FB <- F4   via $00:13FB mirror (first seen)
+WRAM $11234 <- CD   via $7F:1234 direct (was 00)
+summary: direct=10 mirror=43 other=203 new_known=12
+totals: bus_writes=4096 wram_writes=731 known_WRAM=284/131072 bytes (0.22%)
+```
 
-1. SNES OFF.
-2. Power/program the RP2350B over USB.
-3. Open the serial terminal.
-4. Wait for `READY`.
-5. Turn the SNES ON.
+## Important
 
-Power down in the reverse order: SNES first, RP2350B second.
+Fix any cartridge/connector mechanical contact issue before treating captured addresses as trustworthy.
+
+Keep the RP2350B powered before powering the SNES when directly connecting SNES bus signals to RP2350B GPIOs.
