@@ -1,45 +1,69 @@
-# SNES RP2350B v1.7 — Wide Timing Sweep
+# SNES RP2350B v1.8 — /ROMSEL Qualified Diagnostic
 
-The v1.6 result showed an important flaw in the previous timing diagnostic:
-**all eight slots were still ~98% PHI2-high**. That means the old sweep covered
-too little time and never really crossed the bus phase transition.
+This test adds **one wire** so the RP2350 can distinguish genuine cartridge-ROM
+reads from every other A-bus read.
 
-v1.7 fixes that.
+## New wire
 
-## What changes
-
-- 16 snapshots per `/RD` event instead of 8.
-- Capture PIO runs at `clkdiv=2.0`.
-- Consecutive snapshots are about **53 ns apart** at the normal 150 MHz system clock.
-- S0 through S15 span about **800 ns**.
-- GP0 is still captured, so the result table shows exactly where PHI2 changes.
-
-No wiring changes are required.
-
-## Build and flash
-
-This is a **new firmware**. Upload the project contents to GitHub and run the build workflow.
-
-The generated UF2 is:
+With the SNES powered OFF:
 
 ```text
-snes_rp2350b_wide_timing_sweep.uf2
+SNES cartridge connector pin 49  /ROMSEL  ->  RP2350 GP36
 ```
 
-The workflow uses `build/*.uf2`.
+Keep all existing wiring unchanged.
+
+**Do not use GP20 for this.** On the SpotPear RP2350B MINI-A it is connected to
+the onboard WS2812/RGB LED.
+
+GP36 is used only as an input.
+
+## Why this is useful
+
+The SNES asserts `/ROMSEL` specifically for cartridge-ROM accesses. The v1.8
+trigger only records a cycle when:
+
+```text
+/RD = LOW
+AND
+/ROMSEL = LOW
+```
+
+That removes WRAM, MMIO and unrelated bus reads from the ROM comparison.
+
+For a 512 KiB LoROM, once a cycle is known to be a ROM cycle, the physical ROM
+offset is fully determined by CPU A0..A14 and A16..A19, all of which are already
+inside the atomic GP0..GP31 capture.
+
+## Safety
+
+- RP2350 powered before the SNES.
+- Common ground.
+- GP36 is input-only.
+- Do not feed SNES +5 V into the RP board power rail.
+- Turn the SNES off before unplugging the RP2350.
+
+## Build / flash
+
+This is a **new UF2**.
+
+Upload the project to GitHub and run the workflow. It uploads `build/*.uf2`.
+
+Expected firmware:
+
+```text
+snes_rp2350b_romsel_qualified.uf2
+```
 
 ## Run
 
-Close PuTTY, RA2Snes and anything else using COM7:
-
 ```powershell
-python .\wide_timing_sweep_verify.py --port COM7 --rom "C:\Users\flavi\Downloads\RA2Snes-windows-x64\Tom and Jerry (USA).sfc" --seconds 60
+python .\romsel_edge_verify.py --port COM7 --rom "C:\Users\flavi\Downloads\RA2Snes-windows-x64\Tom and Jerry (USA).sfc" --seconds 60
 ```
 
-Play normally.
-
-Send the entire `--- FINAL TIMING SWEEP ---` table and `BEST SLOT`.
-
-The key check is no longer only the match percentage. The `PHI2 high` column
-must visibly change across the 16 slots. If it does not, the sweep still did not
-cover the relevant transition and we should not draw conclusions about timing.
+Send ChatGPT:
+- `ROMSEL-QUALIFIED SUMMARY`
+- `BEST ADDRESS/DATA COMBINATIONS`
+- `PHYSICALLY EXPECTED`
+- `BEST`
+- `INTERPRETATION`

@@ -1,12 +1,21 @@
 .pio_version 1
-.program snes_read_trigger
+.program snes_romsel_read_trigger
 ; PIO2, GPIO base = 16
-; GP35 = CPU /RD
-; Notify PIO0 IRQ1 once per /RD-low pulse.
+;
+; GP35 = CPU /RD       (active low)
+; GP36 = /ROMSEL       (NEW WIRE, active low)
+;
+; We only notify PIO0 for genuine cartridge-ROM read cycles.
+; If /RD is low but /ROMSEL is high, discard that bus cycle.
 
 .wrap_target
     wait 0 gpio 35
+    jmp pin non_rom
     irq next 1
     wait 1 gpio 35
-    nop
+    jmp wrap_target
+
+non_rom:
+    wait 1 gpio 35
+    jmp wrap_target
 .wrap

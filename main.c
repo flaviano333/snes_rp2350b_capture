@@ -16,6 +16,7 @@
 #include "capture_read_trigger.pio.h"
 
 #define PIN_RD          35
+#define PIN_ROMSEL      36
 #define SLOT_COUNT      16u
 #define EVENT_COUNT     16u
 #define WORD_COUNT      (SLOT_COUNT * EVENT_COUNT)   // 256 DMA words
@@ -159,17 +160,17 @@ int main(void) {
     while (!stdio_usb_connected()) sleep_ms(50);
     sleep_ms(250);
 
-    printf("\n=== SNES RP2350B v1.7 WIDE TIMING SWEEP ===\n");
-    printf("Diagnostic-only firmware. No wiring changes required.\n");
-    printf("Each /RD event produces 16 atomic GP0..GP31 snapshots.\n");
+    printf("\n=== SNES RP2350B v1.8 ROMSEL-QUALIFIED SWEEP ===\n");
+    printf("Diagnostic-only firmware. Requires ONE new wire: SNES /ROMSEL pin 49 -> RP2350 GP36.\n");
+    printf("Each qualified /RD + /ROMSEL ROM-read event produces 16 atomic GP0..GP31 snapshots.\n");
     printf("Capture SM clkdiv=2; consecutive slots are ~53 ns apart at 150 MHz.\n");
     printf("GP0=PHI2 GP1=/WR GP2-9=D0-7; GP10-31 include A0-A19 wiring.\n");
     printf("Keep RP2350B powered before SNES. Type HELP for commands.\n\n");
     fflush(stdout);
 
     // Inputs only. GP0..39 on RP2350B are the 5V-tolerant bank when IOVDD=3.3V.
-    for (uint pin = 0; pin <= 35; ++pin) {
-        configure_input(pin, pin == PIN_RD);
+    for (uint pin = 0; pin <= 36; ++pin) {
+        configure_input(pin, pin == PIN_RD || pin == PIN_ROMSEL);
     }
 
     // PIO0 captures one 32-bit word containing GP0..GP31.
@@ -193,10 +194,12 @@ int main(void) {
     const uint sm_rd = 0;
     int base_rd_rc = pio_set_gpio_base(pio_rd, 16);
     pio_gpio_init(pio_rd, PIN_RD);
-    pio_sm_set_consecutive_pindirs(pio_rd, sm_rd, PIN_RD, 1, false);
+    pio_gpio_init(pio_rd, PIN_ROMSEL);
+    pio_sm_set_consecutive_pindirs(pio_rd, sm_rd, PIN_RD, 2, false);
 
-    uint off_rd = pio_add_program(pio_rd, &snes_read_trigger_program);
-    pio_sm_config c_rd = snes_read_trigger_program_get_default_config(off_rd);
+    uint off_rd = pio_add_program(pio_rd, &snes_romsel_read_trigger_program);
+    pio_sm_config c_rd = snes_romsel_read_trigger_program_get_default_config(off_rd);
+    sm_config_set_jmp_pin(&c_rd, PIN_ROMSEL);
     int init_rd_rc = pio_sm_init(pio_rd, sm_rd, off_rd, &c_rd);
 
     printf("PIO init: base_cap=%d init_cap=%d base_rd=%d init_rd=%d sys_hz=%lu\n",
@@ -232,7 +235,7 @@ int main(void) {
     pio_sm_set_enabled(pio_cap, sm_cap, true);
     pio_sm_set_enabled(pio_rd, sm_rd, true);
 
-    printf("READY. Run wide_timing_sweep_verify.py from the PC.\n\n");
+    printf("READY. Run romsel_edge_verify.py from the PC.\n\n");
     fflush(stdout);
 
     while (true) {
