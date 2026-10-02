@@ -36,5 +36,5 @@ jobs:
       - name: Upload UF2
         uses: actions/upload-artifact@v4
         with:
-          name: snes-rp2350b-v1.6-timing-sweep-uf2
+          name: snes-rp2350b-ra-bridge-v1.3.1-atomic-snapshot-fixed-uf2
           path: build/*.uf2

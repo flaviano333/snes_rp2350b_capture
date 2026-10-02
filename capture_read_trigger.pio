@@ -1,23 +1,19 @@
 .pio_version 1
-.program snes_romsel_read_trigger
-; PIO2, GPIO base = 16
+.program snes_read_trigger
+; RP2350B PIO2, GPIO base = 16
 ;
-; GP35 = CPU /RD       (active low)
-; GP36 = /ROMSEL       (active low)
+; Physical GP35 = CPU /RD
 ;
-; Only notify PIO0 for genuine cartridge-ROM read cycles.
-; Explicit "start:" label is used because .wrap_target is a directive,
-; not a jump label.
+; IMPORTANT:
+; WAIT GPIO indices are RELATIVE to the PIO GPIO base.
+; Therefore physical GP35 is index 35-16 = 19.
+;
+; Detect one A-bus read cycle and notify PIO0 through cross-PIO IRQ1.
+; PIO2 NEXT wraps to PIO0 on RP2350.
 
 .wrap_target
-start:
-    wait 0 gpio 35
-    jmp pin non_rom
-    irq next 1
-    wait 1 gpio 35
-    jmp start
-
-non_rom:
-    wait 1 gpio 35
-    jmp start
+    wait 0 gpio 19         ; physical GP35 /RD asserted (active low)
+    irq next 1             ; set IRQ1 in PIO0
+    wait 1 gpio 19         ; physical GP35 released
+    nop
 .wrap
