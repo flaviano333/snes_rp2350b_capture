@@ -94,8 +94,59 @@ def cmd_dump(port, path):
         print(f"Completed capture batches: {batches}")
 
 
+
+def cmd_snap(port, ranges):
+    parsed = []
+    total = 0
+    for token in ranges:
+        if ":" not in token:
+            raise ValueError(f"Bad range {token!r}; use OFFSET:LENGTH in hex")
+        a, b = token.split(":", 1)
+        off = int(a, 16)
+        length = int(b, 16)
+        parsed.append((off, length))
+        total += length
+
+    with open_serial(port) as ser:
+        send_line(ser, "SNAP " + " ".join(ranges))
+        header = None
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            line = ser.readline()
+            if not line:
+                continue
+            text = line.decode("ascii", errors="ignore").strip()
+            if text.startswith("SNAP1 "):
+                header = text
+                break
+            if text.startswith("ERR "):
+                raise RuntimeError(text)
+        if header is None:
+            raise RuntimeError("Did not receive SNAP1 header")
+
+        parts = header.split()
+        if len(parts) != 5:
+            raise RuntimeError(f"Bad SNAP header: {header}")
+        count, got_total, unknown, batch = map(int, parts[1:])
+        if count != len(parsed) or got_total != total:
+            raise RuntimeError(f"SNAP shape mismatch: {header}")
+        data = read_exact(ser, total)
+        known = read_exact(ser, total)
+
+        pos = 0
+        print(f"SNAP ranges={count} bytes={total} unknown={unknown} batch={batch}")
+        for off, length in parsed:
+            vals = data[pos:pos+length]
+            flags = known[pos:pos+length]
+            chunks = []
+            for v, k in zip(vals, flags):
+                chunks.append(f"{v:02X}" if k else "??")
+            print(f"{off:05X}:{length:X}  " + " ".join(chunks))
+            pos += length
+
+
 def main():
-    ap = argparse.ArgumentParser(description="SNES RP2350B WRAM Bridge v1.2 client")
+    ap = argparse.ArgumentParser(description="SNES RP2350B WRAM Bridge v1.3 client")
     ap.add_argument("port", help="serial port, e.g. COM7 or /dev/ttyACM0")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
@@ -117,6 +168,9 @@ def main():
     p_dump = sub.add_parser("dump")
     p_dump.add_argument("path", nargs="?", default="wram.bin")
 
+    p_snap = sub.add_parser("snap")
+    p_snap.add_argument("ranges", nargs="+", help="hex OFFSET:LENGTH pairs, e.g. 00026:1 00AE8:2")
+
     args = ap.parse_args()
 
     if args.cmd == "info":
@@ -135,6 +189,8 @@ def main():
         cmd_simple(args.port, f"HEX {args.offset} {args.length}")
     elif args.cmd == "dump":
         cmd_dump(args.port, args.path)
+    elif args.cmd == "snap":
+        cmd_snap(args.port, args.ranges)
     else:
         ap.error("unknown command")
 

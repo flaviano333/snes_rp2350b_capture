@@ -26,8 +26,10 @@
 #define SAMPLE_COUNT   256
 #define WRAM_SIZE      (128u * 1024u)
 #define VALID_SIZE     (WRAM_SIZE / 8u)
-#define CMD_BUF_SIZE   128
+#define CMD_BUF_SIZE   4096
 #define DEBUG_MAX_LINES 4096u
+#define SNAP_MAX_RANGES 256u
+#define SNAP_MAX_BYTES  4096u
 
 static uint32_t low_samples[SAMPLE_COUNT];
 static uint32_t high_samples[SAMPLE_COUNT];
@@ -55,6 +57,10 @@ static uint64_t total_wmdata_reconstructed_writes = 0;
 static uint64_t total_wmdata_reconstructed_reads = 0;
 static uint64_t total_wmdata_unknown_pointer = 0;
 static uint32_t completed_batches = 0;
+static uint64_t total_snapshots = 0;
+static uint32_t last_snapshot_ranges = 0;
+static uint32_t last_snapshot_bytes = 0;
+static uint32_t last_snapshot_unknown = 0;
 
 // CPU-side WRAM port ($2180-$2183) shadow.  The three WMADD registers form
 // a 17-bit pointer.  This is useful when a game accesses WRAM above $1FFF
@@ -64,6 +70,13 @@ static uint8_t wmadd_known_mask = 0; // bit0=$2181, bit1=$2182, bit2=$2183
 
 static char cmd_buf[CMD_BUF_SIZE];
 static size_t cmd_len = 0;
+
+// Machine-readable atomic snapshot staging. The mirror is single-threaded: while
+// command_snap() copies these bytes, process_read/write_batch() cannot modify WRAM.
+// DMA can continue collecting bus samples in the background, so all returned
+// bytes represent one coherent software-mirror instant.
+static uint8_t snap_data[SNAP_MAX_BYTES];
+static uint8_t snap_known[SNAP_MAX_BYTES];
 
 // Physical wiring actually measured on the prototype.
 // Index = logical SNES address bit A0..A23, value = RP2350B GPIO.
@@ -439,6 +452,7 @@ static void print_help(void) {
     printf("  HEX [offset] [length]   human-readable WRAM dump (max 4096 bytes)\n");
     printf("  DUMPBIN                 binary snapshot: 128 KiB WRAM + 16 KiB valid bitmap\n");
     printf("  RBIN <off> <len>        raw WRAM range for PC bridge (hex; max 1000 bytes)\n");
+    printf("  SNAP o:l [o:l ...]      atomic multi-range WRAM snapshot for RA bridge\n");
     printf("  CLEAR                   clear the software mirror/known bitmap\n");
     printf("  DEBUG                   show debug status\n");
     printf("  DEBUG WRAM [N]          print next N WRAM accesses (default 64)\n");
@@ -458,7 +472,8 @@ static void print_info(void) {
     printf("INFO batches=%lu bus_writes=%llu wram_writes=%llu direct_w=%llu mirror_w=%llu "
            "bus_reads=%llu wram_reads=%llu direct_r=%llu mirror_r=%llu "
            "wmaddr_w=%llu wmdata_w=%llu wmdata_r=%llu wm_recon_w=%llu wm_recon_r=%llu "
-           "wm_unknown=%llu known=%lu/%u (%.2f%%)\n",
+           "wm_unknown=%llu snap_count=%llu snap_ranges=%lu snap_bytes=%lu snap_unknown=%lu "
+           "known=%lu/%u (%.2f%%)\n",
            (unsigned long)completed_batches,
            (unsigned long long)total_bus_writes,
            (unsigned long long)total_wram_writes,
@@ -474,6 +489,10 @@ static void print_info(void) {
            (unsigned long long)total_wmdata_reconstructed_writes,
            (unsigned long long)total_wmdata_reconstructed_reads,
            (unsigned long long)total_wmdata_unknown_pointer,
+           (unsigned long long)total_snapshots,
+           (unsigned long)last_snapshot_ranges,
+           (unsigned long)last_snapshot_bytes,
+           (unsigned long)last_snapshot_unknown,
            (unsigned long)known_wram_bytes,
            (unsigned)WRAM_SIZE,
            (double)known_wram_bytes * 100.0 / (double)WRAM_SIZE);
@@ -635,6 +654,90 @@ static void command_rbin(char *args) {
     fflush(stdout);
 }
 
+
+static void command_snap(char *args) {
+    // Syntax: SNAP OOOOO:L OOOOO:L ...
+    // Offsets and lengths are hexadecimal. Response payload is:
+    //   SNAP1 <ranges> <bytes> <unknown> <batch>\n
+    //   <bytes raw WRAM data>
+    //   <bytes raw known flags: 1=known, 0=unknown>
+    //   \nEND SNAP1\n
+    // Data/known bytes are copied before any USB payload is emitted, so a single
+    // SNAP response cannot mix values from different mirror updates.
+    if (!args || !*args) {
+        printf("ERR SNAP expects <offset:length> [offset:length ...] in hex\n");
+        return;
+    }
+
+    uint32_t total_len = 0;
+    uint32_t unknown = 0;
+    uint32_t ranges = 0;
+
+    for (char *tok = strtok(args, " \t"); tok; tok = strtok(NULL, " \t")) {
+        if (ranges >= SNAP_MAX_RANGES) {
+            printf("ERR SNAP too many ranges (max %u)\n", (unsigned)SNAP_MAX_RANGES);
+            return;
+        }
+
+        char *colon = strchr(tok, ':');
+        if (!colon) {
+            printf("ERR SNAP token '%s' expects offset:length\n", tok);
+            return;
+        }
+        *colon = '\0';
+        const char *off_s = tok;
+        const char *len_s = colon + 1;
+        uint32_t off = 0, len = 0;
+        if (!parse_hex_u32(off_s, &off) || !parse_hex_u32(len_s, &len)) {
+            printf("ERR SNAP expects hexadecimal offset:length tokens\n");
+            return;
+        }
+        if (off >= WRAM_SIZE || len == 0 || off + len > WRAM_SIZE) {
+            printf("ERR SNAP range out of bounds at %05lX:%lX\n",
+                   (unsigned long)off, (unsigned long)len);
+            return;
+        }
+        if (total_len + len > SNAP_MAX_BYTES) {
+            printf("ERR SNAP total payload too large (max %u bytes)\n", (unsigned)SNAP_MAX_BYTES);
+            return;
+        }
+
+        for (uint32_t i = 0; i < len; ++i) {
+            uint32_t src = off + i;
+            bool known = wram_byte_known(src);
+            snap_data[total_len] = wram[src];
+            snap_known[total_len] = known ? 1u : 0u;
+            if (!known) ++unknown;
+            ++total_len;
+        }
+        ++ranges;
+    }
+
+    if (ranges == 0 || total_len == 0) {
+        printf("ERR SNAP empty request\n");
+        return;
+    }
+
+    // Everything above this point is the atomic copy. From here on, only the
+    // staging buffers are transmitted; changes in WRAM no longer affect this response.
+    ++total_snapshots;
+    last_snapshot_ranges = ranges;
+    last_snapshot_bytes = total_len;
+    last_snapshot_unknown = unknown;
+    uint32_t batch_stamp = completed_batches;
+    printf("SNAP1 %lu %lu %lu %lu\n",
+           (unsigned long)ranges,
+           (unsigned long)total_len,
+           (unsigned long)unknown,
+           (unsigned long)batch_stamp);
+    fflush(stdout);
+    stdio_put_string((const char *)snap_data, (int)total_len, false, false);
+    stdio_put_string((const char *)snap_known, (int)total_len, false, false);
+    stdio_flush();
+    printf("\nEND SNAP1\n");
+    fflush(stdout);
+}
+
 static void execute_command(char *line) {
     while (*line == ' ' || *line == '\t') ++line;
     if (!*line) return;
@@ -667,6 +770,8 @@ static void execute_command(char *line) {
         command_dumpbin();
     } else if (!strcmp(cmd, "RBIN")) {
         command_rbin(rest);
+    } else if (!strcmp(cmd, "SNAP")) {
+        command_snap(rest);
     } else if (!strcmp(cmd, "CLEAR")) {
         memset(wram, 0, sizeof(wram));
         memset(wram_valid, 0, sizeof(wram_valid));
@@ -784,14 +889,14 @@ int main(void) {
     memset(wram, 0, sizeof(wram));
     memset(wram_valid, 0, sizeof(wram_valid));
 
-    printf("\n=== SNES RP2350B RA Bridge Firmware v1.2 WMDATA ===\n");
-    printf("Passive A-bus monitor with address remap + CPU WMDATA ($2180-$2183) reconstruction.\n");
+    printf("\n=== SNES RP2350B RA Bridge Firmware v1.3 ATOMIC SNAPSHOT ===\n");
+    printf("Passive A-bus monitor with address remap + atomic multi-range RA snapshots.\n");
     printf("PHI2=GP0 /WR=GP1 /RD=GP35 D0-D7=GP2-9; address GPIO order is remapped in firmware.\n");
     printf("The 128 KiB mirror learns from direct/mirror WRAM traffic and CPU-side WMDATA accesses; unseen bytes remain UNKNOWN.\n");
     printf("Keep the RP2350B powered before powering the SNES.\n");
     printf("Measured map: A0=12 A1=11 A2=10 A3=13 A4=14 A5=16 A6=15 A7=17\n");
     printf("              A8=19 A9=21 A10=22 ... A22=34 A23=18 (GP20 skipped)\n");
-    printf("Type HELP for commands; DEBUG WRAM 64 or DEBUG WMDATA 64 shows live-style bus data.\n\n");
+    printf("Type HELP for commands; SNAP is used by the v1.3 RA bridge for coherent reads.\n\n");
     fflush(stdout);
 
     for (uint pin = 0; pin <= 35; ++pin) {
@@ -900,8 +1005,8 @@ int main(void) {
     channel_config_set_write_increment(&dc_read_hi, true);
     channel_config_set_dreq(&dc_read_hi, pio_get_dreq(pio_hi, sm_read_hi, false));
 
-    printf("READY. Read+write capture runs quietly in the background (v1.2 WMDATA).\n");
-    printf("Use INFO, BANKS, WMSTATE, DEBUG, READ, READSNES, HEX, DUMPBIN or RBIN.\n\n");
+    printf("READY. Read+write capture runs quietly in the background (v1.3 atomic snapshot).\n");
+    printf("Use INFO, BANKS, WMSTATE, DEBUG, READ, READSNES, HEX, DUMPBIN, RBIN or SNAP.\n\n");
     fflush(stdout);
 
     // Start both capture pipelines. Each pipeline is independently rearmed when its
@@ -940,8 +1045,8 @@ int main(void) {
     pio_sm_set_enabled(pio_rd, sm_rd_trigger, true);
 
     while (true) {
-        poll_serial_commands();
-
+        // Process completed capture batches before servicing serial commands so an
+        // atomic SNAP sees the freshest software mirror available at that boundary.
         if (dma_remaining(dma_lo) == 0 && dma_remaining(dma_hi) == 0) {
             pio_sm_set_enabled(pio_lo, sm_lo, false);
             pio_sm_set_enabled(pio_hi, sm_hi, false);
@@ -979,6 +1084,8 @@ int main(void) {
             pio_sm_set_enabled(pio_lo, sm_read_lo, true);
             pio_sm_set_enabled(pio_rd, sm_rd_trigger, true);
         }
+
+        poll_serial_commands();
 
         tight_loop_contents();
     }
