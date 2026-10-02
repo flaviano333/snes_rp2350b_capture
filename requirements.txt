@@ -1,2 +1,1 @@
 pyserial>=3.5
-websockets>=13,<16

@@ -1,15 +1,12 @@
 .pio_version 1
 .program snes_read_trigger
-; RP2350 PIO2, GPIO base = 16
-;
+; PIO2, GPIO base = 16
 ; GP35 = CPU /RD
-;
-; Detect one A-bus read cycle and notify PIO0 through cross-PIO IRQ1.
-; PIO2 NEXT wraps to PIO0 on RP2350.
+; Notify PIO0 IRQ1 once per read cycle.
 
 .wrap_target
-    wait 0 gpio 35         ; /RD asserted (active low)
-    irq next 1             ; set IRQ1 in PIO0
-    wait 1 gpio 35         ; wait until this read cycle ends
+    wait 0 gpio 35
+    irq next 1             ; PIO2 NEXT wraps to PIO0 on RP2350
+    wait 1 gpio 35
     nop
 .wrap

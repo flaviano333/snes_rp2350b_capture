@@ -1,0 +1,22 @@
+.pio_version 1
+.program snes_capture_atomic_read
+; PIO0, GPIO base = 0
+;
+; One state machine snapshots GP2..GP31 in ONE ISR word.
+; This contains:
+;   GP2..GP9   = D0..D7
+;   GP10..GP31 = all physical address wires needed to verify a 512 KiB LoROM
+;                 through logical A0..A19 (GP20 is simply a dummy bit).
+;
+; PIO2 signals IRQ1 in PIO0 when CPU /RD is asserted.
+; We then sample on PHI2 falling edge. No second PIO address word is paired later.
+
+.wrap_target
+    wait 1 irq 1           ; read-cycle event from PIO2; clears PIO0 IRQ1
+    wait 1 gpio 0          ; PHI2 high / address stable
+    wait 0 gpio 0          ; sample at PHI2 falling edge
+    mov isr, null
+    in pins, 30            ; GP2..GP31 atomically
+    push block
+    nop
+.wrap
