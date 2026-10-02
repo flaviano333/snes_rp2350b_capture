@@ -2,16 +2,18 @@
 .program snes_capture_high
 ; RP2350 PIO1, GPIO base = 16
 ;
-; GP18     = A8
-; GP19     = A9
+; Measured prototype wiring:
+; GP18     = A23
+; GP19     = A8
 ; GP20     = unused/dummy (on-board LED pin)
-; GP21-34  = A10-A23
+; GP21-34  = A9-A22
+; C code remaps these raw GPIO bits back to logical A8-A23.
 ;
 ; PIO0 executes `irq next 0` only for a write cycle while PHI2 is high.
 ; On RP2350, NEXT from PIO0 targets PIO1. WAIT IRQ 0 waits on PIO1's
 ; own IRQ0 flag and clears it when the wait completes.
 ;
-; in_base = GP18. IN PINS,17 reads GP18..GP34; bit 2 (GP20) is discarded.
+; in_base = GP18. IN PINS,17 reads raw GP18..GP34; C code reorders them.
 
 .wrap_target
     wait 1 irq 0           ; event sent internally by PIO0, no jumper needed

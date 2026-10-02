@@ -2,10 +2,12 @@
 .program snes_capture_read_high
 ; RP2350 PIO1 SM1, GPIO base = 16
 ;
-; GP18     = A8
-; GP19     = A9
+; Measured prototype wiring:
+; GP18     = A23
+; GP19     = A8
 ; GP20     = unused/dummy
-; GP21-34  = A10-A23
+; GP21-34  = A9-A22
+; C code remaps these raw GPIO bits back to logical A8-A23.
 ;
 ; PIO0 signals IRQ1 while PHI2 is high.
 

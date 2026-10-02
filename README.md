@@ -1,75 +1,139 @@
-# SNES RP2350B RA Bridge v1.0 — WRAM reads + writes
+# SNES RP2350B RA Bridge v1.1 — address remap + debug
 
-This version is aimed at the first reliable RetroAchievements tests.
+This version keeps the v1.0 A-bus read/write capture and fixes the address reconstruction to match the **actual wiring measured on this prototype**. No address wires need to be resoldered just to put them in numerical order: the firmware reorders the sampled GPIO bits in software.
 
-## One new wire
+## Physical wiring used by v1.1
 
-Keep all existing wiring from v0.9 and add:
+Timing/data signals are unchanged:
 
-- SNES cartridge pin **23 (CPU /RD)** -> **GP35** on the RP2350B
-
-The normal cartridge connector exposes CPU /RD on pin 23, so no extra side-tab contact is required.
-
-Existing wiring remains:
-
-- GP0 = PHI2 (cart pin 57)
-- GP1 = /WR (cart pin 54)
+- GP0 = PHI2
+- GP1 = CPU /WR
 - GP2..GP9 = D0..D7
-- GP10..GP19 = A0..A9
-- GP20 unused by SNES wiring
-- GP21..GP34 = A10..A23
-- GP35 = /RD (cart pin 23) **NEW**
+- GP35 = CPU /RD
 - common GND
 
-Keep the RP2350B powered before powering the SNES.
+Measured address wiring:
 
-## Why this version exists
+| SNES | RP2350B |
+|---|---:|
+| A0 | GP12 |
+| A1 | GP11 |
+| A2 | GP10 |
+| A3 | GP13 |
+| A4 | GP14 |
+| A5 | GP16 |
+| A6 | GP15 |
+| A7 | GP17 |
+| A8 | GP19 |
+| A9 | GP21 |
+| A10 | GP22 |
+| A11 | GP23 |
+| A12 | GP24 |
+| A13 | GP25 |
+| A14 | GP26 |
+| A15 | GP27 |
+| A16 | GP28 |
+| A17 | GP29 |
+| A18 | GP30 |
+| A19 | GP31 |
+| A20 | GP32 |
+| A21 | GP33 |
+| A22 | GP34 |
+| A23 | GP18 |
 
-v0.9 only learned bytes when the SNES *wrote* them after the adapter started. That leaves stale/unknown bytes, especially above WRAM $1FFF. RA2Snes was observed requesting offsets such as $287A and $2AF2.
+GP20 remains unused by the SNES wiring because it is associated with the board's onboard RGB LED.
 
-v1.0 also passively captures A-bus **reads**. When the CPU reads WRAM, the actual byte on D0-D7 is used to initialise or repair the software mirror. This should greatly increase the number of WRAM bytes that RA2Snes can read correctly.
+A0/A1/A2/A3/A4/A5/A6/A7, A8..A13, A22 and A23 were checked during diagnosis. A14..A21 follow the continuous sequence between the confirmed endpoints; if the corrected bank counters still look impossible, verify those eight wires individually.
 
-This still does not monitor the B-bus / $2180 WRAM port directly, and DMA capture is still batched, so this is not yet guaranteed 100% coverage.
+## Why this matters
 
-## Firmware architecture
+The older firmware assumed the logical address bits were wired in numerical GPIO order. In the actual prototype, A0/A2 and A5/A6 are rearranged, and the high block is rotated so A23 is on GP18 while A8..A22 continue from GP19/GP21..GP34.
 
-- PIO0 SM0 + PIO1 SM0: A-bus writes (existing path)
-- PIO2 SM0: watches /RD on GP35 and signals PIO0
-- PIO0 SM1 + PIO1 SM1: A-bus reads
-- four DMA channels collect paired low/high samples
-- WRAM mirror is updated from both reads and writes
+That corrupts the reconstructed 24-bit SNES address even though the console itself continues to run normally. In particular, bad A16..A23 reconstruction can make real bank `$7E/$7F` WRAM traffic look like unrelated banks, which can explain `direct_r=0` and `direct_w=0` in v1.0.
 
-## Build
+## New debug commands
 
-Use the included GitHub Actions workflow exactly as in previous versions. Flash the generated `.uf2`.
+The normal firmware is quiet so it can be used by the Python RA bridge. For diagnostics in PuTTY, v1.1 can print captured bus traffic in the same style as the earlier capture firmware.
 
-## Quick validation
+```text
+DEBUG WRAM 64
+```
 
-With PuTTY open, run:
+Prints the next 64 reconstructed WRAM accesses, then turns debug off automatically. Example:
+
+```text
+WRITE $7E:287A = 3C   [WRAM +0x0287A DIRECT]
+READ  $00:13FB = F4   [WRAM +0x013FB MIRROR]
+DEBUG DONE (auto-off)
+```
+
+Other modes:
+
+```text
+DEBUG ALL 64
+DEBUG READ 64
+DEBUG WRITE 64
+DEBUG OFF
+DEBUG
+```
+
+The number is decimal, defaults to 64, and can be 1..4096. Debug printing intentionally slows the main loop and can create additional capture gaps, so use it only for short diagnostics. **Do not leave debug enabled while running the Python/RA2Snes bridge.** The Python v1.1 bridge also sends `DEBUG OFF` when it opens the serial port as a safeguard.
+
+## Bank diagnostic
+
+The new command:
+
+```text
+BANKS
+```
+
+shows reconstructed A-bus traffic per bank:
+
+```text
+BANK 00 W=12345 R=45678
+BANK 7E W=2345 R=9876
+BANK 7F W=120 R=540
+END BANKS
+```
+
+After the wiring remap, seeing activity on `7E` and/or `7F` is the key test. `INFO` should then also begin showing nonzero `direct_w` and/or `direct_r`.
+
+## Recommended first test
+
+1. Flash the v1.1 UF2.
+2. Power the RP2350B first, then the SNES.
+3. Open PuTTY and let the game run for a few seconds.
+4. Run:
 
 ```text
 INFO
+BANKS
+DEBUG WRAM 64
 ```
 
-You should now see both write and read counters, for example:
+5. Look especially for `$7E:xxxx` / `$7F:xxxx` entries marked `DIRECT`.
+6. Close PuTTY before starting the Python bridge.
 
-```text
-INFO ... bus_writes=... wram_writes=... bus_reads=... wram_reads=... direct_r=... known=.../131072 (...)
-```
-
-The important signs are `bus_reads > 0`, `wram_reads > 0`, and ideally `direct_r > 0`.
-
-Then close PuTTY and run the Python bridge as before:
+Then run the RA bridge as before:
 
 ```powershell
 python ra_usb2snes_bridge.py --port COM7 --rom "C:\ROMs\Tom and Jerry (USA).sfc" --verbose
 ```
 
-Launch RA2Snes in Softcore mode.
+Start RA2Snes in Softcore mode.
 
-## Current limitations
+## Build
 
-1. The adapter is still passive and cannot force a read of arbitrary WRAM.
-2. WRAM accesses made only through the B-bus/WMDATA path can still be missed until their values are later observed on A-bus reads/writes.
-3. DMA buffers are still rearmed in batches, so there are short capture gaps.
-4. Hardcore SD2SNES control/patch features are not implemented.
+The included GitHub Actions workflow builds with Pico SDK 2.2.0 and uploads `snes_rp2350b_capture.uf2` as the workflow artifact `snes-rp2350b-ra-bridge-v1.1-uf2`.
+
+## Remaining limitations
+
+- WRAM values are still learned passively from observed A-bus reads and writes.
+- B-bus/WMDATA (`$2180`) traffic is not directly reconstructed yet.
+- DMA capture is still rearmed in batches, leaving short gaps.
+- Heavy debug printing makes those gaps worse; use it only temporarily.
+- Hardcore SD2SNES control/patch behavior is not implemented.
+
+## Electrical safety
+
+Keep the same prototype precautions: use only the RP2350B GPIOs already chosen for the 5 V SNES signals, keep all SNES-connected GPIOs as inputs, share GND, power the RP2350B before the SNES, and turn the SNES off before unplugging the RP2350B.

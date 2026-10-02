@@ -26,14 +26,15 @@
 #define WRAM_SIZE      (128u * 1024u)
 #define VALID_SIZE     (WRAM_SIZE / 8u)
 #define CMD_BUF_SIZE   128
+#define DEBUG_MAX_LINES 4096u
 
 static uint32_t low_samples[SAMPLE_COUNT];
 static uint32_t high_samples[SAMPLE_COUNT];
 static uint32_t read_low_samples[SAMPLE_COUNT];
 static uint32_t read_high_samples[SAMPLE_COUNT];
 
-// Passive WRAM mirror. A byte is marked valid only after this adapter
-// has actually observed a write to it.
+// Passive WRAM mirror. A byte is marked valid after this adapter
+// has observed a WRAM read or write carrying that byte.
 static uint8_t wram[WRAM_SIZE];
 static uint8_t wram_valid[VALID_SIZE];
 static uint32_t known_wram_bytes = 0;
@@ -50,6 +51,30 @@ static uint32_t completed_batches = 0;
 
 static char cmd_buf[CMD_BUF_SIZE];
 static size_t cmd_len = 0;
+
+// Physical wiring actually measured on the prototype.
+// Index = logical SNES address bit A0..A23, value = RP2350B GPIO.
+// The PIO programs capture raw GPIO windows; address bits are reordered here.
+static const uint8_t ADDRESS_GPIO[24] = {
+    12, 11, 10, 13, 14, 16, 15, 17,  // A0..A7
+    19, 21, 22, 23, 24, 25, 26, 27,  // A8..A15
+    28, 29, 30, 31, 32, 33, 34, 18   // A16..A23
+};
+
+typedef enum {
+    DEBUG_OFF = 0,
+    DEBUG_ALL,
+    DEBUG_WRAM,
+    DEBUG_READ,
+    DEBUG_WRITE
+} debug_mode_t;
+
+static debug_mode_t debug_mode = DEBUG_OFF;
+static uint32_t debug_remaining = 0;
+static uint64_t bank_write_counts[256];
+static uint64_t bank_read_counts[256];
+
+static void strtoupper_inplace(char *s);
 
 static void configure_input(uint pin, bool pull_up) {
     gpio_init(pin);
@@ -70,12 +95,24 @@ static uint32_t unpack_high17(uint32_t raw) {
     return (raw >> 15) & 0x1ffffu;
 }
 
+static inline uint32_t sampled_gpio_bit(uint16_t low16, uint32_t high17, uint gpio) {
+    // low16 bit 0 is GP2 and bit 15 is GP17.
+    if (gpio >= 10 && gpio <= 17) {
+        return (low16 >> (gpio - 2u)) & 1u;
+    }
+    // high17 bit 0 is GP18 and bit 16 is GP34.
+    if (gpio >= 18 && gpio <= 34) {
+        return (high17 >> (gpio - 18u)) & 1u;
+    }
+    return 0;
+}
+
 static uint32_t reconstruct_address(uint16_t low16, uint32_t high17) {
-    uint32_t a0_a7 = (low16 >> 8) & 0xffu;
-    uint32_t a8_a9 = high17 & 0x3u;
-    uint32_t a10_a23 = (high17 >> 3) & 0x3fffu;
-    uint32_t a8_a23 = a8_a9 | (a10_a23 << 2);
-    return a0_a7 | (a8_a23 << 8);
+    uint32_t address = 0;
+    for (uint bit = 0; bit < 24; ++bit) {
+        address |= sampled_gpio_bit(low16, high17, ADDRESS_GPIO[bit]) << bit;
+    }
+    return address;
 }
 
 static void arm_dma_channel(int channel, const dma_channel_config *cfg,
@@ -102,6 +139,115 @@ static bool map_address_to_wram(uint32_t address, uint32_t *offset, bool *direct
     }
 
     return false;
+}
+
+static const char *debug_mode_name(debug_mode_t mode) {
+    switch (mode) {
+        case DEBUG_ALL: return "ALL";
+        case DEBUG_WRAM: return "WRAM";
+        case DEBUG_READ: return "READ";
+        case DEBUG_WRITE: return "WRITE";
+        default: return "OFF";
+    }
+}
+
+static bool parse_debug_count(const char *s, uint32_t *out) {
+    if (!s || !*s) return false;
+    char *end = NULL;
+    unsigned long v = strtoul(s, &end, 10);
+    if (end == s || *end != '\0' || v == 0 || v > DEBUG_MAX_LINES) return false;
+    *out = (uint32_t)v;
+    return true;
+}
+
+static void maybe_debug_access(bool is_read, uint32_t address, uint8_t data,
+                               bool is_wram, uint32_t wram_offset, bool direct) {
+    if (debug_mode == DEBUG_OFF || debug_remaining == 0) return;
+
+    bool match = false;
+    switch (debug_mode) {
+        case DEBUG_ALL: match = true; break;
+        case DEBUG_WRAM: match = is_wram; break;
+        case DEBUG_READ: match = is_read; break;
+        case DEBUG_WRITE: match = !is_read; break;
+        default: break;
+    }
+    if (!match) return;
+
+    uint8_t bank = (uint8_t)(address >> 16);
+    uint16_t addr = (uint16_t)address;
+    printf("%s $%02X:%04X = %02X", is_read ? "READ " : "WRITE", bank, addr, data);
+    if (is_wram) {
+        printf("   [WRAM +0x%05lX %s]", (unsigned long)wram_offset,
+               direct ? "DIRECT" : "MIRROR");
+    }
+    printf("\n");
+    fflush(stdout);
+
+    --debug_remaining;
+    if (debug_remaining == 0) {
+        debug_mode = DEBUG_OFF;
+        printf("DEBUG DONE (auto-off)\n");
+        fflush(stdout);
+    }
+}
+
+static void command_debug(char *args) {
+    if (!args || !*args) {
+        printf("DEBUG mode=%s remaining=%lu\n", debug_mode_name(debug_mode),
+               (unsigned long)debug_remaining);
+        return;
+    }
+
+    char temp[64];
+    strncpy(temp, args, sizeof(temp) - 1);
+    temp[sizeof(temp) - 1] = '\0';
+    char *mode = strtok(temp, " \t");
+    char *count_s = strtok(NULL, " \t");
+    strtoupper_inplace(mode);
+
+    if (!strcmp(mode, "OFF")) {
+        debug_mode = DEBUG_OFF;
+        debug_remaining = 0;
+        printf("OK DEBUG OFF\n");
+        return;
+    }
+
+    debug_mode_t new_mode;
+    if (!strcmp(mode, "ALL")) new_mode = DEBUG_ALL;
+    else if (!strcmp(mode, "WRAM")) new_mode = DEBUG_WRAM;
+    else if (!strcmp(mode, "READ")) new_mode = DEBUG_READ;
+    else if (!strcmp(mode, "WRITE")) new_mode = DEBUG_WRITE;
+    else {
+        printf("ERR DEBUG expects OFF, ALL, WRAM, READ or WRITE\n");
+        return;
+    }
+
+    uint32_t count = 64;
+    if (count_s && !parse_debug_count(count_s, &count)) {
+        printf("ERR DEBUG count must be decimal 1-%u\n", (unsigned)DEBUG_MAX_LINES);
+        return;
+    }
+
+    debug_mode = new_mode;
+    debug_remaining = count;
+    printf("OK DEBUG %s %lu (auto-off after matching lines)\n",
+           debug_mode_name(debug_mode), (unsigned long)debug_remaining);
+}
+
+static void command_banks(void) {
+    printf("BANKS nonzero reconstructed A-bus banks:\n");
+    uint32_t shown = 0;
+    for (uint32_t b = 0; b < 256; ++b) {
+        if (bank_write_counts[b] || bank_read_counts[b]) {
+            printf("BANK %02lX W=%llu R=%llu\n", (unsigned long)b,
+                   (unsigned long long)bank_write_counts[b],
+                   (unsigned long long)bank_read_counts[b]);
+            ++shown;
+        }
+    }
+    if (!shown) printf("(none yet)\n");
+    printf("END BANKS\n");
 }
 
 static bool wram_byte_known(uint32_t offset) {
@@ -150,8 +296,16 @@ static void print_help(void) {
     printf("  DUMPBIN                 binary snapshot: 128 KiB WRAM + 16 KiB valid bitmap\n");
     printf("  RBIN <off> <len>        raw WRAM range for PC bridge (hex; max 1000 bytes)\n");
     printf("  CLEAR                   clear the software mirror/known bitmap\n");
+    printf("  DEBUG                   show debug status\n");
+    printf("  DEBUG WRAM [N]          print next N WRAM accesses (default 64)\n");
+    printf("  DEBUG ALL [N]           print next N A-bus accesses\n");
+    printf("  DEBUG READ [N]          print next N reads\n");
+    printf("  DEBUG WRITE [N]         print next N writes\n");
+    printf("  DEBUG OFF               stop debug output\n");
+    printf("  BANKS                   show per-bank read/write counters\n");
     printf("  PING                    reply PONG\n");
     printf("Mirror source: observed WRAM reads + writes.\n");
+    printf("DEBUG is diagnostic only: use it in PuTTY with the Python RA bridge closed.\n");
 }
 
 static void print_info(void) {
@@ -364,6 +518,10 @@ static void execute_command(char *line) {
         memset(wram_valid, 0, sizeof(wram_valid));
         known_wram_bytes = 0;
         printf("OK mirror cleared\n");
+    } else if (!strcmp(cmd, "DEBUG")) {
+        command_debug(rest);
+    } else if (!strcmp(cmd, "BANKS")) {
+        command_banks();
     } else {
         printf("ERR unknown command '%s' (type HELP)\n", cmd);
     }
@@ -403,12 +561,16 @@ static void process_write_batch(void) {
         uint32_t high17 = unpack_high17(high_samples[i]);
         uint8_t data = (uint8_t)(low16 & 0xffu);
         uint32_t address = reconstruct_address(low16, high17) & 0xffffffu;
+        uint8_t bank = (uint8_t)(address >> 16);
 
         ++total_bus_writes;
+        ++bank_write_counts[bank];
 
-        uint32_t wram_offset;
-        bool direct;
-        if (!map_address_to_wram(address, &wram_offset, &direct)) continue;
+        uint32_t wram_offset = 0;
+        bool direct = false;
+        bool is_wram = map_address_to_wram(address, &wram_offset, &direct);
+        maybe_debug_access(false, address, data, is_wram, wram_offset, direct);
+        if (!is_wram) continue;
 
         ++total_wram_writes;
         if (direct) ++total_direct_writes;
@@ -425,12 +587,16 @@ static void process_read_batch(void) {
         uint32_t high17 = unpack_high17(read_high_samples[i]);
         uint8_t data = (uint8_t)(low16 & 0xffu);
         uint32_t address = reconstruct_address(low16, high17) & 0xffffffu;
+        uint8_t bank = (uint8_t)(address >> 16);
 
         ++total_bus_reads;
+        ++bank_read_counts[bank];
 
-        uint32_t wram_offset;
-        bool direct;
-        if (!map_address_to_wram(address, &wram_offset, &direct)) continue;
+        uint32_t wram_offset = 0;
+        bool direct = false;
+        bool is_wram = map_address_to_wram(address, &wram_offset, &direct);
+        maybe_debug_access(true, address, data, is_wram, wram_offset, direct);
+        if (!is_wram) continue;
 
         ++total_wram_reads;
         if (direct) ++total_direct_reads;
@@ -454,12 +620,14 @@ int main(void) {
     memset(wram, 0, sizeof(wram));
     memset(wram_valid, 0, sizeof(wram_valid));
 
-    printf("\n=== SNES RP2350B RA Bridge Firmware v1.0 RW ===\n");
-    printf("Passive A-bus read+write monitor; /RD=GP35; no PHI2/WR duplicate jumpers.\n");
-    printf("PHI2=GP0 /WR=GP1 /RD=GP35 D0-D7=GP2-9 A0-A9=GP10-19 GP20 skipped A10-A23=GP21-34.\n");
+    printf("\n=== SNES RP2350B RA Bridge Firmware v1.1 REMAP+DEBUG ===\n");
+    printf("Passive A-bus read+write monitor; measured address wiring remapped in software.\n");
+    printf("PHI2=GP0 /WR=GP1 /RD=GP35 D0-D7=GP2-9; address GPIO order is remapped in firmware.\n");
     printf("The 128 KiB mirror learns from observed WRAM reads and writes; unseen bytes remain UNKNOWN.\n");
     printf("Keep the RP2350B powered before powering the SNES.\n");
-    printf("Type HELP for commands.\n\n");
+    printf("Measured map: A0=12 A1=11 A2=10 A3=13 A4=14 A5=16 A6=15 A7=17\n");
+    printf("              A8=19 A9=21 A10=22 ... A22=34 A23=18 (GP20 skipped)\n");
+    printf("Type HELP for commands; DEBUG WRAM 64 shows live-style bus data.\n\n");
     fflush(stdout);
 
     for (uint pin = 0; pin <= 35; ++pin) {
@@ -568,8 +736,8 @@ int main(void) {
     channel_config_set_write_increment(&dc_read_hi, true);
     channel_config_set_dreq(&dc_read_hi, pio_get_dreq(pio_hi, sm_read_hi, false));
 
-    printf("READY. Read+write capture runs quietly in the background.\n");
-    printf("Use INFO, READ, READSNES, HEX, DUMPBIN or RBIN.\n\n");
+    printf("READY. Read+write capture runs quietly in the background (v1.1 remap).\n");
+    printf("Use INFO, BANKS, DEBUG, READ, READSNES, HEX, DUMPBIN or RBIN.\n\n");
     fflush(stdout);
 
     // Start both capture pipelines. Each pipeline is independently rearmed when its

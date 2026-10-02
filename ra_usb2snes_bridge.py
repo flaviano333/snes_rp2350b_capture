@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-RP2350B read+write WRAM -> usb2snes compatibility bridge for RA2Snes.
+RP2350B v1.1 remapped read+write WRAM -> usb2snes compatibility bridge for RA2Snes.
 
 This program exposes a small subset of the QUsb2Snes WebSocket protocol on
 ws://127.0.0.1:23074 and maps usb2snes WRAM reads (0xF50000+) to the
 RP2350B firmware's passive WRAM mirror.
 
 It also serves a local SNES ROM file so RA2Snes can identify/hash the game.
-Target: RA2Snes Softcore mode. Firmware v1.0 learns WRAM from reads and writes.
+Target: RA2Snes Softcore mode. Firmware v1.1 remaps the measured address wiring and learns WRAM from reads and writes.
 """
 import argparse
 import asyncio
@@ -23,7 +23,7 @@ import websockets
 USB2SNES_WRAM_BASE = 0xF50000
 WRAM_SIZE = 128 * 1024
 USB2SNES_SRAM_BASE = 0xE00000
-DEVICE_NAME = "RP2350B RA Bridge RW"
+DEVICE_NAME = "RP2350B RA Bridge v1.1"
 CONFIG_YML = (
     "EnableCheats: false\n"
     "EnableIngameSavestate: 0\n"
@@ -57,6 +57,14 @@ class SerialWRAM:
 
     def ping(self):
         with self.lock:
+            # Unsolicited firmware debug text would corrupt RBIN framing.
+            # v1.1 supports DEBUG OFF, so force quiet mode before starting RA2Snes.
+            self.ser.reset_input_buffer()
+            self._send_line("DEBUG OFF")
+            try:
+                self._readline_until(b"OK DEBUG OFF", 0.75)
+            except TimeoutError:
+                pass
             self.ser.reset_input_buffer()
             self._send_line("PING")
             line = self._readline_until(b"PONG", 2.0)
@@ -230,7 +238,7 @@ async def amain(args):
     sw = SerialWRAM(args.port, args.baud)
     try:
         if not sw.ping():
-            raise RuntimeError("RP2350B did not answer PING. Flash v0.9 firmware and close PuTTY first.")
+            raise RuntimeError("RP2350B did not answer PING. Flash v1.1 firmware and close PuTTY first.")
 
         bridge = BridgeServer(sw, rom, args.verbose)
         print("RP2350B serial: OK")

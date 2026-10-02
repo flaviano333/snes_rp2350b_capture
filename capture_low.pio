@@ -5,13 +5,13 @@
 ; GP0      = PHI2
 ; GP1      = /WR (jmp pin)
 ; GP2-9    = D0-D7
-; GP10-17  = A0-A7
+; GP10-17  = raw address wires; firmware remaps them to A0-A7
 ;
 ; This state machine is the timing master.
 ; On each write cycle it signals IRQ0 in the NEXT PIO block (PIO1),
 ; allowing PIO1 to snapshot A8-A23 without any external jumper.
 ;
-; in_base = GP2.  IN PINS,16 reads GP2..GP17.
+; in_base = GP2. IN PINS,16 reads GP2..GP17; C code reorders address bits.
 
 .wrap_target
     wait 1 gpio 0          ; PHI2 high: address bus is stable

@@ -95,7 +95,7 @@ def cmd_dump(port, path):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="SNES RP2350B WRAM Bridge v0.8 client")
+    ap = argparse.ArgumentParser(description="SNES RP2350B WRAM Bridge v1.1 client")
     ap.add_argument("port", help="serial port, e.g. COM7 or /dev/ttyACM0")
     sub = ap.add_subparsers(dest="cmd", required=True)
 

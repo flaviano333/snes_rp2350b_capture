@@ -4,7 +4,7 @@
 ;
 ; GP0      = PHI2
 ; GP2-9    = D0-D7
-; GP10-17  = A0-A7
+; GP10-17  = raw address wires; firmware remaps them to A0-A7
 ;
 ; PIO2 signals IRQ1 in PIO0 when /RD is asserted.
 ; We then synchronise to PHI2, ask PIO1 to snapshot A8-A23,
