@@ -1,74 +1,71 @@
-# SNES RP2350B v1.8.1 — /ROMSEL Qualified Diagnostic
+# SNES RP2350B v1.8.2 — /ROMSEL Qualified Diagnostic
 
-This test adds **one wire** so the RP2350 can distinguish genuine cartridge-ROM
-reads from every other A-bus read.
+This fixes an important RP2350B PIO addressing bug in v1.8/v1.8.1.
 
-## New wire
-
-With the SNES powered OFF:
+PIO2 is configured with:
 
 ```text
-SNES cartridge connector pin 49  /ROMSEL  ->  RP2350 GP36
+GPIO base = 16
 ```
 
-Keep all existing wiring unchanged.
-
-**Do not use GP20 for this.** On the SpotPear RP2350B MINI-A it is connected to
-the onboard WS2812/RGB LED.
-
-GP36 is used only as an input.
-
-## Why this is useful
-
-The SNES asserts `/ROMSEL` specifically for cartridge-ROM accesses. The v1.8
-trigger only records a cycle when:
+PIO instructions such as `WAIT GPIO n` use `n` **relative to that base**.
+Therefore physical GP35 must be referenced in PIO assembly as:
 
 ```text
-/RD = LOW
-AND
-/ROMSEL = LOW
+35 - 16 = 19
 ```
 
-That removes WRAM, MMIO and unrelated bus reads from the ROM comparison.
+The incorrect builds used `wait gpio 35`, so the trigger was not actually
+waiting on physical GP35 as intended.
 
-For a 512 KiB LoROM, once a cycle is known to be a ROM cycle, the physical ROM
-offset is fully determined by CPU A0..A14 and A16..A19, all of which are already
-inside the atomic GP0..GP31 capture.
+v1.8.2 uses:
 
-## Safety
+```pio
+wait 0 gpio 19
+...
+wait 1 gpio 19
+```
 
-- RP2350 powered before the SNES.
-- Common ground.
-- GP36 is input-only.
-- Do not feed SNES +5 V into the RP board power rail.
-- Turn the SNES off before unplugging the RP2350.
+while `JMP PIN` remains configured through the SDK for physical GP36 (/ROMSEL).
+
+## Wiring
+
+```text
+A23      -> GP18
+/RD      -> GP35
+/ROMSEL  -> GP36
+```
+
+## Extra firmware verification
+
+The Python verifier now asks the RP2350 for `INFO` before starting. It must see:
+
+```text
+version=1.8.2
+rd=GP35
+romsel=GP36
+pio2_base=16
+rd_wait_index=19
+```
+
+If you accidentally flash an older UF2, the test will stop instead of silently
+producing misleading numbers.
 
 ## Build / flash
 
-This is a **new UF2**.
+Build a new UF2 from this project and flash it.
 
-Upload the project to GitHub and run the workflow. It uploads `build/*.uf2`.
-
-Expected firmware:
-
-```text
-snes_rp2350b_romsel_qualified.uf2
-```
-
-## Run
+Then run:
 
 ```powershell
 python .\romsel_edge_verify.py --port COM7 --rom "C:\Users\flavi\Downloads\RA2Snes-windows-x64\Tom and Jerry (USA).sfc" --seconds 60
 ```
 
-Send ChatGPT:
-- `ROMSEL-QUALIFIED SUMMARY`
-- `BEST ADDRESS/DATA COMBINATIONS`
-- `PHYSICALLY EXPECTED`
-- `BEST`
-- `INTERPRETATION`
+At startup, first look for:
 
+```text
+Firmware handshake OK:
+  INFO version=1.8.2 ...
+```
 
-## v1.8.1 fix
-
-Fixes the PIO assembler error `undefined symbol 'wrap_target'` by using an explicit `start:` label.
+Only trust the ROM comparison if that appears.
