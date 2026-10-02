@@ -1,4 +1,4 @@
-# SNES RP2350B v1.8 — /ROMSEL Qualified Diagnostic
+# SNES RP2350B v1.8.1 — /ROMSEL Qualified Diagnostic
 
 This test adds **one wire** so the RP2350 can distinguish genuine cartridge-ROM
 reads from every other A-bus read.
@@ -67,3 +67,8 @@ Send ChatGPT:
 - `PHYSICALLY EXPECTED`
 - `BEST`
 - `INTERPRETATION`
+
+
+## v1.8.1 fix
+
+Fixes the PIO assembler error `undefined symbol 'wrap_target'` by using an explicit `start:` label.

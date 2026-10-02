@@ -3,19 +3,21 @@
 ; PIO2, GPIO base = 16
 ;
 ; GP35 = CPU /RD       (active low)
-; GP36 = /ROMSEL       (NEW WIRE, active low)
+; GP36 = /ROMSEL       (active low)
 ;
-; We only notify PIO0 for genuine cartridge-ROM read cycles.
-; If /RD is low but /ROMSEL is high, discard that bus cycle.
+; Only notify PIO0 for genuine cartridge-ROM read cycles.
+; Explicit "start:" label is used because .wrap_target is a directive,
+; not a jump label.
 
 .wrap_target
+start:
     wait 0 gpio 35
     jmp pin non_rom
     irq next 1
     wait 1 gpio 35
-    jmp wrap_target
+    jmp start
 
 non_rom:
     wait 1 gpio 35
-    jmp wrap_target
+    jmp start
 .wrap
