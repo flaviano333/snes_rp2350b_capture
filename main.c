@@ -138,6 +138,7 @@ static void print_help(void) {
     printf("  READSNES <BB:AAAA>      read a SNES address if it maps to WRAM\n");
     printf("  HEX [offset] [length]   human-readable WRAM dump (max 4096 bytes)\n");
     printf("  DUMPBIN                 binary snapshot: 128 KiB WRAM + 16 KiB valid bitmap\n");
+    printf("  RBIN <off> <len>        raw WRAM range for PC bridge (hex; max 1000 bytes)\n");
     printf("  CLEAR                   clear the software mirror/known bitmap\n");
     printf("  PING                    reply PONG\n");
 }
@@ -275,6 +276,41 @@ static void command_dumpbin(void) {
     fflush(stdout);
 }
 
+
+static void command_rbin(char *args) {
+    if (!args || !*args) {
+        printf("ERR RBIN expects <offset> <length> in hex\n");
+        return;
+    }
+
+    char temp[64];
+    strncpy(temp, args, sizeof(temp) - 1);
+    temp[sizeof(temp) - 1] = '\0';
+    char *a = strtok(temp, " \t");
+    char *b = strtok(NULL, " \t");
+    uint32_t start = 0, len = 0;
+    if (!a || !b || !parse_hex_u32(a, &start) || !parse_hex_u32(b, &len)) {
+        printf("ERR RBIN expects hexadecimal <offset> <length>\n");
+        return;
+    }
+    if (start >= WRAM_SIZE || len == 0 || len > 0x1000u || start + len > WRAM_SIZE) {
+        printf("ERR RBIN range out of bounds (WRAM 00000-1FFFF, len 1-1000)\n");
+        return;
+    }
+
+    uint32_t unknown = 0;
+    for (uint32_t i = 0; i < len; ++i) {
+        if (!wram_byte_known(start + i)) ++unknown;
+    }
+
+    printf("RBIN1 %lu %lu\n", (unsigned long)len, (unsigned long)unknown);
+    fflush(stdout);
+    stdio_put_string((const char *)&wram[start], (int)len, false, false);
+    stdio_flush();
+    printf("\nEND RBIN1\n");
+    fflush(stdout);
+}
+
 static void execute_command(char *line) {
     while (*line == ' ' || *line == '\t') ++line;
     if (!*line) return;
@@ -305,6 +341,8 @@ static void execute_command(char *line) {
         command_hex(rest);
     } else if (!strcmp(cmd, "DUMPBIN")) {
         command_dumpbin();
+    } else if (!strcmp(cmd, "RBIN")) {
+        command_rbin(rest);
     } else if (!strcmp(cmd, "CLEAR")) {
         memset(wram, 0, sizeof(wram));
         memset(wram_valid, 0, sizeof(wram_valid));
@@ -376,7 +414,7 @@ int main(void) {
     memset(wram, 0, sizeof(wram));
     memset(wram_valid, 0, sizeof(wram_valid));
 
-    printf("\n=== SNES RP2350B WRAM Bridge v0.8 ===\n");
+    printf("\n=== SNES RP2350B RA Bridge Firmware v0.9 ===\n");
     printf("Passive A-bus monitor; no GP35/GP36 jumpers.\n");
     printf("PHI2=GP0 /WR=GP1 D0-D7=GP2-9 A0-A9=GP10-19 GP20 skipped A10-A23=GP21-34.\n");
     printf("The 128 KiB mirror is PARTIAL: only observed writes are marked KNOWN.\n");
@@ -446,7 +484,7 @@ int main(void) {
     channel_config_set_dreq(&dc_hi, pio_get_dreq(pio_hi, sm_hi, false));
 
     printf("READY. Capture runs quietly in the background.\n");
-    printf("Use INFO, READ, READSNES, HEX or DUMPBIN.\n\n");
+    printf("Use INFO, READ, READSNES, HEX, DUMPBIN or RBIN.\n\n");
     fflush(stdout);
 
     while (true) {

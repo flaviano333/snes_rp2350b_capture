@@ -1,81 +1,100 @@
-# SNES RP2350B WRAM Bridge v0.8
+# SNES RP2350B RA Bridge v0.9
 
-Experimental firmware for the SpotPear RP2350B-MINI-A used as a passive SNES bus monitor.
+Proof-of-concept bridge from a passive SNES cartridge-bus monitor to RA2Snes.
 
-This version turns the v0.7 WRAM mirror into a simple USB serial memory bridge.
+## Hardware wiring
 
-## Wiring
+Same as v0.8. No GP35/GP36 jumpers.
 
-Unchanged from v0.6/v0.7:
+- GP0 = PHI2
+- GP1 = /WR
+- GP2..GP9 = D0..D7
+- GP10..GP19 = A0..A9
+- GP20 unused by SNES wiring
+- GP21..GP34 = A10..A23
+- common GND
 
-- GP0 <- SNES PHI2
-- GP1 <- SNES /WR
-- GP2..GP9 <- D0..D7
-- GP10..GP19 <- A0..A9
-- GP20 is skipped
-- GP21..GP34 <- A10..A23
-- SNES GND -> RP2350B GND
+Keep RP2350B powered before powering the SNES.
 
-No GP35/GP36 jumpers are required.
+## What changed in firmware
 
-## Commands
+Adds a machine-readable command:
 
-Open the USB CDC COM port (PuTTY works for text commands) and type:
+`RBIN <WRAM offset hex> <length hex>`
 
-```text
-HELP
-INFO
-READ 013FB
-READSNES 00:13FB
-HEX 01300 100
-CLEAR
-PING
-```
+Maximum length per request is 0x1000 bytes.
 
-Hexadecimal is used for addresses and lengths.
+Response framing:
 
-`READ` uses the canonical 128 KiB WRAM offset (`00000` to `1FFFF`).
+`RBIN1 <decimal length> <decimal unknown-byte-count>\n`
 
-`READSNES` accepts a SNES address and maps direct `$7E/$7F` accesses or the low-bank 8 KiB WRAM mirrors to the canonical WRAM offset.
+then raw bytes, then:
 
-`HEX` prints a human-readable region. Unknown bytes are displayed as `??`.
+`END RBIN1`
 
-## DUMPBIN protocol
+The existing INFO, READ, READSNES, HEX and DUMPBIN commands remain available.
 
-`DUMPBIN` is intended for software, not PuTTY. The device sends:
+## PC-side RA2Snes compatibility bridge
 
-```text
-BIN1 131072 16384 <known_bytes> <completed_batches>\n
-```
+`ra_usb2snes_bridge.py`:
 
-followed immediately by:
+- opens the RP2350B serial port;
+- exposes a usb2snes-compatible WebSocket server on `ws://127.0.0.1:23074`;
+- maps usb2snes WRAM `0xF50000..0xF6FFFF` to the RP2350B WRAM mirror;
+- serves a local ROM file to RA2Snes for game identification/hash;
+- emulates the minimum DeviceList / Attach / Info / AppVersion / GetFile / GetAddress commands needed for a first RA2Snes Softcore test.
 
-1. 131072 raw WRAM bytes
-2. 16384 raw bytes containing the validity bitmap (1 bit per WRAM byte)
-3. `\nEND BIN1\n`
+This is a passive bridge. PutAddress/control commands are not implemented. Use **Softcore** for the first tests.
 
-The raw payload is sent with CR/LF translation disabled.
+## Build firmware
 
-A helper script `wram_client.py` is included.
+Use the included GitHub Actions workflow as with the previous versions. Flash the generated `.uf2` to the RP2350B.
 
-Examples:
+## Install PC dependencies
 
 ```powershell
-pip install pyserial
-python wram_client.py COM7 info
-python wram_client.py COM7 read 013FB
-python wram_client.py COM7 read-snes 00:13FB
-python wram_client.py COM7 dump wram.bin
+py -m pip install -r requirements.txt
 ```
 
-The `dump` command creates `wram.bin` and `wram.bin.valid`.
+or:
 
-## Important limitation
+```powershell
+py -m pip install pyserial "websockets>=13,<16"
+```
 
-This is still a **partial mirror**. A byte becomes known only after the adapter observes a write to it. This A-bus prototype may also miss WRAM modifications made through paths not yet monitored, and the current capture engine rearms in finite DMA batches rather than using a lossless ping-pong ring.
+## Run
 
-So this v0.8 is a bridge/protocol milestone, not yet the final RetroAchievements transport.
+Close PuTTY first so it releases the COM port.
 
-Fix any cartridge/connector contact issue before treating captured data as trustworthy.
+Use a ROM file that matches the cartridge/game being played:
 
-Keep the RP2350B powered before powering the SNES when directly connecting SNES bus signals to RP2350B GPIOs.
+```powershell
+py ra_usb2snes_bridge.py --port COM7 --rom "C:\ROMs\Tom and Jerry.sfc"
+```
+
+Expected output:
+
+```text
+RP2350B serial: OK
+ROM: Tom and Jerry.sfc (... bytes cartridge data)
+usb2snes compatibility server: ws://127.0.0.1:23074
+Do NOT run QUsb2Snes at the same time (same TCP port).
+Start RA2Snes and use SOFTCORE for this first test.
+```
+
+Then launch RA2Snes. Do not launch QUsb2Snes; this Python program is taking its place.
+
+For protocol debugging:
+
+```powershell
+py ra_usb2snes_bridge.py --port COM7 --rom "C:\ROMs\game.sfc" --verbose
+```
+
+## Important current limitations
+
+1. The WRAM mirror is write-observed. Bytes not written since the RP started remain unknown internally; the compatibility layer currently returns the mirror byte value to RA2Snes.
+2. Capture still rearms DMA in batches, so there are small gaps between batches. Tight one-frame conditions may be missed.
+3. This version is intended for Softcore proof-of-concept testing. Hardcore integrity checks and SD2SNES write/hook commands are not implemented.
+4. The supplied ROM file is used for RA2Snes game identification. It must correspond to the game actually running.
+
+The next engineering step after proving RA2Snes connectivity is ping-pong/ring DMA for gapless capture.
