@@ -3,37 +3,32 @@
 #include <stdbool.h>
 #include <string.h>
 #include <stdlib.h>
+
 #include "pico/stdlib.h"
 #include "pico/stdio.h"
 #include "pico/stdio_usb.h"
 #include "hardware/pio.h"
 #include "hardware/dma.h"
 #include "hardware/gpio.h"
-#include "capture_atomic_read.pio.h"
+#include "hardware/clocks.h"
+
+#include "capture_timing_sweep.pio.h"
 #include "capture_read_trigger.pio.h"
 
-#define PIN_PHI2       0
-#define PIN_DATA_BASE  2
-#define PIN_RD         35
-#define SAMPLE_COUNT   256
-#define CMD_BUF_SIZE   128
-#define TRACE_MAX      4096u
+#define PIN_RD          35
+#define SLOT_COUNT      8u
+#define EVENT_COUNT     32u
+#define WORD_COUNT      (SLOT_COUNT * EVENT_COUNT)   // 256 DMA words
+#define CMD_BUF_SIZE    128
+#define TRACE_MAX       4096u
 
-static uint32_t samples[SAMPLE_COUNT];
+static uint32_t words[WORD_COUNT];
 static char cmd_buf[CMD_BUF_SIZE];
 static size_t cmd_len = 0;
-static uint32_t trace_remaining = 0;
-static uint64_t total_read_cycles = 0;
-static uint64_t total_rom_candidates = 0;
-static uint64_t total_batches = 0;
 
-// Logical A0..A19 -> measured physical GPIO.
-// These are all inside GP10..GP31, so one PIO0 word contains them atomically.
-static const uint8_t ADDRESS_GPIO_A0_A19[20] = {
-    12, 11, 10, 13, 14, 16, 15, 17,  // A0..A7
-    19, 21, 22, 23, 24, 25, 26, 27,  // A8..A15
-    28, 29, 30, 31                    // A16..A19
-};
+static uint32_t trace_events_remaining = 0;
+static uint64_t total_events = 0;
+static uint64_t total_batches = 0;
 
 static void configure_input(uint pin, bool pull_up) {
     gpio_init(pin);
@@ -46,35 +41,15 @@ static uint32_t dma_remaining(uint channel) {
     return dma_channel_hw_addr(channel)->transfer_count & 0x0fffffffu;
 }
 
-static void arm_dma_channel(int channel, const dma_channel_config *cfg,
-                            volatile void *write_addr, const volatile void *read_addr) {
-    dma_channel_configure(channel, cfg, write_addr, read_addr, SAMPLE_COUNT, false);
-}
-
-static inline uint32_t pins30_from_raw(uint32_t raw) {
-    // SHIFT_RIGHT + IN PINS,30 places the 30 sampled bits in raw[31:2].
-    // After >>2: bit0=GP2, bit1=GP3, ... bit29=GP31.
-    return raw >> 2;
-}
-
-static inline uint32_t physical_gpio_bit(uint32_t pins30, uint gpio) {
-    if (gpio < 2 || gpio > 31) return 0;
-    return (pins30 >> (gpio - 2u)) & 1u;
-}
-
-static uint32_t reconstruct_a0_a19(uint32_t pins30) {
-    uint32_t a = 0;
-    for (uint bit = 0; bit < 20; ++bit) {
-        a |= physical_gpio_bit(pins30, ADDRESS_GPIO_A0_A19[bit]) << bit;
-    }
-    return a;
+static void arm_dma_channel(int channel, const dma_channel_config *cfg) {
+    dma_channel_configure(channel, cfg, words, &pio0->rxf[0], WORD_COUNT, false);
 }
 
 static void print_help(void) {
     printf("Commands:\n");
     printf("  INFO\n");
-    printf("  ATOMICREAD <1-4096>   print that many candidate LoROM reads\n");
-    printf("  OFF                   stop printing\n");
+    printf("  SWEEPREAD <1-4096>   print that many /RD events, each with 8 timing slots\n");
+    printf("  OFF                  stop printing\n");
     printf("  PING\n");
 }
 
@@ -100,25 +75,28 @@ static void execute_command(char *line) {
     } else if (!strcmp(line, "PING")) {
         printf("PONG\n");
     } else if (!strcmp(line, "INFO")) {
-        printf("INFO batches=%llu read_cycles=%llu rom_candidates=%llu trace_remaining=%lu\n",
+        uint32_t sys_hz = clock_get_hz(clk_sys);
+        printf("INFO batches=%llu events=%llu trace_events=%lu sys_hz=%lu slots=%u\n",
                (unsigned long long)total_batches,
-               (unsigned long long)total_read_cycles,
-               (unsigned long long)total_rom_candidates,
-               (unsigned long)trace_remaining);
+               (unsigned long long)total_events,
+               (unsigned long)trace_events_remaining,
+               (unsigned long)sys_hz,
+               (unsigned)SLOT_COUNT);
     } else if (!strcmp(line, "OFF")) {
-        trace_remaining = 0;
+        trace_events_remaining = 0;
         printf("OK OFF\n");
-    } else if (!strcmp(line, "ATOMICREAD")) {
+    } else if (!strcmp(line, "SWEEPREAD")) {
         if (!rest || !*rest) {
-            printf("ATOMICREAD remaining=%lu\n", (unsigned long)trace_remaining);
+            printf("SWEEPREAD remaining=%lu\n",
+                   (unsigned long)trace_events_remaining);
         } else {
             char *end = NULL;
             unsigned long n = strtoul(rest, &end, 10);
             if (end == rest || *end != '\0' || n < 1 || n > TRACE_MAX) {
-                printf("ERR ATOMICREAD count must be decimal 1-4096\n");
+                printf("ERR SWEEPREAD count must be decimal 1-4096\n");
             } else {
-                trace_remaining = (uint32_t)n;
-                printf("OK ATOMICREAD %lu\n", n);
+                trace_events_remaining = (uint32_t)n;
+                printf("OK SWEEPREAD %lu\n", n);
             }
         }
     } else {
@@ -131,6 +109,7 @@ static void poll_serial_commands(void) {
     while (true) {
         int c = getchar_timeout_us(0);
         if (c == PICO_ERROR_TIMEOUT) break;
+
         if (c == '\r' || c == '\n') {
             if (cmd_len) {
                 cmd_buf[cmd_len] = '\0';
@@ -139,10 +118,12 @@ static void poll_serial_commands(void) {
             }
             continue;
         }
+
         if ((c == 8 || c == 127) && cmd_len) {
             --cmd_len;
             continue;
         }
+
         if (c >= 32 && c <= 126 && cmd_len + 1 < CMD_BUF_SIZE) {
             cmd_buf[cmd_len++] = (char)c;
         }
@@ -151,33 +132,25 @@ static void poll_serial_commands(void) {
 
 static void process_batch(void) {
     ++total_batches;
-    for (uint i = 0; i < SAMPLE_COUNT; ++i) {
-        uint32_t pins30 = pins30_from_raw(samples[i]);
-        uint8_t data = (uint8_t)(pins30 & 0xffu);
-        uint32_t a = reconstruct_a0_a19(pins30);
-        ++total_read_cycles;
 
-        // For ordinary LoROM, upper-half CPU reads (A15=1) are ROM candidates.
-        // Tom & Jerry USA is 512 KiB, so the physical ROM offset uses A0..A14
-        // and A16..A19. A20+ are mirrors and are intentionally not needed here.
-        if (((a >> 15) & 1u) == 0) continue;
+    for (uint e = 0; e < EVENT_COUNT; ++e) {
+        ++total_events;
 
-        uint32_t bank_low4 = (a >> 16) & 0x0fu;
-        uint32_t offset = (bank_low4 << 15) | (a & 0x7fffu);
-        ++total_rom_candidates;
+        if (trace_events_remaining) {
+            const uint32_t *s = &words[e * SLOT_COUNT];
+            printf("SWEEP");
+            for (uint slot = 0; slot < SLOT_COUNT; ++slot) {
+                printf(" %08lX", (unsigned long)s[slot]);
+            }
+            printf("\n");
 
-        if (trace_remaining) {
-            printf("ATOM P=%08lX D=%02X O=%05lX A20=%05lX\n",
-                   (unsigned long)(pins30 & 0x3fffffffu),
-                   data,
-                   (unsigned long)(offset & 0x7ffffu),
-                   (unsigned long)(a & 0xfffffu));
-            --trace_remaining;
-            if (trace_remaining == 0) {
-                printf("ATOMIC DONE\n");
+            --trace_events_remaining;
+            if (trace_events_remaining == 0) {
+                printf("SWEEP DONE\n");
             }
         }
     }
+
     if (stdio_usb_connected()) fflush(stdout);
 }
 
@@ -186,44 +159,55 @@ int main(void) {
     while (!stdio_usb_connected()) sleep_ms(50);
     sleep_ms(250);
 
-    printf("\n=== SNES RP2350B v1.5 SINGLE-PIO ROM DIAGNOSTIC ===\n");
-    printf("Diagnostic-only firmware: atomic GP2..GP31 capture on CPU reads.\n");
-    printf("PHI2=GP0 /RD=GP35 D0-D7=GP2-9. No wiring change required.\n");
-    printf("For the 512 KiB Tom & Jerry LoROM, A20-A23 are not needed to compute physical ROM offset.\n");
+    printf("\n=== SNES RP2350B v1.6 TIMING SWEEP ===\n");
+    printf("Diagnostic-only firmware. No wiring changes required.\n");
+    printf("Each /RD event produces 8 atomic GP0..GP31 snapshots.\n");
+    printf("Consecutive slots are four PIO clocks apart (IN + NOP[2]).\n");
+    printf("GP0=PHI2 GP1=/WR GP2-9=D0-7; GP10-31 include A0-A19 wiring.\n");
     printf("Keep RP2350B powered before SNES. Type HELP for commands.\n\n");
     fflush(stdout);
 
+    // Inputs only. GP0..39 on RP2350B are the 5V-tolerant bank when IOVDD=3.3V.
     for (uint pin = 0; pin <= 35; ++pin) {
         configure_input(pin, pin == PIN_RD);
     }
 
+    // PIO0 captures one 32-bit word containing GP0..GP31.
     PIO pio_cap = pio0;
     const uint sm_cap = 0;
     int base_cap_rc = pio_set_gpio_base(pio_cap, 0);
+
     for (uint pin = 0; pin <= 31; ++pin) pio_gpio_init(pio_cap, pin);
     pio_sm_set_consecutive_pindirs(pio_cap, sm_cap, 0, 32, false);
 
-    uint off_cap = pio_add_program(pio_cap, &snes_capture_atomic_read_program);
-    pio_sm_config c_cap = snes_capture_atomic_read_program_get_default_config(off_cap);
-    sm_config_set_in_pins(&c_cap, PIN_DATA_BASE);
-    sm_config_set_in_shift(&c_cap, true, false, 32);
+    uint off_cap = pio_add_program(pio_cap, &snes_timing_sweep_program);
+    pio_sm_config c_cap = snes_timing_sweep_program_get_default_config(off_cap);
+    sm_config_set_in_pins(&c_cap, 0);
+    sm_config_set_in_shift(&c_cap, true, true, 32); // autopush each IN PINS,32
     sm_config_set_fifo_join(&c_cap, PIO_FIFO_JOIN_RX);
     int init_cap_rc = pio_sm_init(pio_cap, sm_cap, off_cap, &c_cap);
 
+    // PIO2 watches /RD on GP35 and raises cross-PIO IRQ1 in PIO0.
     PIO pio_rd = pio2;
     const uint sm_rd = 0;
     int base_rd_rc = pio_set_gpio_base(pio_rd, 16);
     pio_gpio_init(pio_rd, PIN_RD);
     pio_sm_set_consecutive_pindirs(pio_rd, sm_rd, PIN_RD, 1, false);
+
     uint off_rd = pio_add_program(pio_rd, &snes_read_trigger_program);
     pio_sm_config c_rd = snes_read_trigger_program_get_default_config(off_rd);
     int init_rd_rc = pio_sm_init(pio_rd, sm_rd, off_rd, &c_rd);
 
-    printf("PIO init: base_cap=%d init_cap=%d base_rd=%d init_rd=%d\n",
-           base_cap_rc, init_cap_rc, base_rd_rc, init_rd_rc);
+    printf("PIO init: base_cap=%d init_cap=%d base_rd=%d init_rd=%d sys_hz=%lu\n",
+           base_cap_rc, init_cap_rc, base_rd_rc, init_rd_rc,
+           (unsigned long)clock_get_hz(clk_sys));
+
     if (base_cap_rc || init_cap_rc || base_rd_rc || init_rd_rc) {
         printf("ERROR PIO init failed; leave SNES off.\n");
-        while (true) { poll_serial_commands(); sleep_ms(10); }
+        while (true) {
+            poll_serial_commands();
+            sleep_ms(10);
+        }
     }
 
     int dma_cap = dma_claim_unused_channel(true);
@@ -235,30 +219,36 @@ int main(void) {
 
     pio_sm_set_enabled(pio_rd, sm_rd, false);
     pio_sm_set_enabled(pio_cap, sm_cap, false);
+
     pio_sm_restart(pio_rd, sm_rd);
     pio_sm_restart(pio_cap, sm_cap);
     pio_sm_clear_fifos(pio_cap, sm_cap);
     pio_interrupt_clear(pio_cap, 1);
-    arm_dma_channel(dma_cap, &dc, samples, &pio_cap->rxf[sm_cap]);
+
+    arm_dma_channel(dma_cap, &dc);
     dma_start_channel_mask(1u << dma_cap);
+
     pio_sm_set_enabled(pio_cap, sm_cap, true);
     pio_sm_set_enabled(pio_rd, sm_rd, true);
 
-    printf("READY. Run atomic_rom_verify.py from the PC.\n\n");
+    printf("READY. Run timing_sweep_verify.py from the PC.\n\n");
     fflush(stdout);
 
     while (true) {
         if (dma_remaining(dma_cap) == 0) {
             pio_sm_set_enabled(pio_rd, sm_rd, false);
             pio_sm_set_enabled(pio_cap, sm_cap, false);
+
             process_batch();
 
             pio_sm_restart(pio_rd, sm_rd);
             pio_sm_restart(pio_cap, sm_cap);
             pio_sm_clear_fifos(pio_cap, sm_cap);
             pio_interrupt_clear(pio_cap, 1);
-            arm_dma_channel(dma_cap, &dc, samples, &pio_cap->rxf[sm_cap]);
+
+            arm_dma_channel(dma_cap, &dc);
             dma_start_channel_mask(1u << dma_cap);
+
             pio_sm_set_enabled(pio_cap, sm_cap, true);
             pio_sm_set_enabled(pio_rd, sm_rd, true);
         }

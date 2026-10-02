@@ -2,11 +2,11 @@
 .program snes_read_trigger
 ; PIO2, GPIO base = 16
 ; GP35 = CPU /RD
-; Notify PIO0 IRQ1 once per read cycle.
+; Notify PIO0 IRQ1 once per /RD-low pulse.
 
 .wrap_target
     wait 0 gpio 35
-    irq next 1             ; PIO2 NEXT wraps to PIO0 on RP2350
+    irq next 1
     wait 1 gpio 35
     nop
 .wrap

@@ -4,4 +4,5 @@ if (-not $env:PICO_SDK_PATH) {
 }
 cmake -S . -B build -G Ninja
 cmake --build build
-Write-Host "UF2: build\snes_rp2350b_single_pio_romdiag.uf2"
+Write-Host "UF2 files:"
+Get-ChildItem build\*.uf2

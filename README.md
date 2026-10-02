@@ -1,61 +1,65 @@
-# SNES RP2350B v1.5 — Single-PIO ROM diagnostic
+# SNES RP2350B v1.6 — Timing Sweep
 
-This is a **diagnostic firmware**, not the RA bridge firmware.
+This is a **diagnostic firmware**.
 
-It tests whether the previous ~45–50% ROM match was caused by pairing two independently captured PIO streams.
+The v1.5 single-PIO test stayed near 50% ROM match, and the pinmap probe found no
+A0-A19 swap that improved the result. v1.6 therefore tests the next hypothesis:
+the previous sample instant may be outside the period where the SNES address and
+ROM data are valid together.
 
-## Important clarification about `FIXED`
+## What v1.6 changes
 
-In v1.4, output such as:
+For every `/RD` assertion, one PIO state machine captures **eight complete
+GP0..GP31 snapshots** in succession.
 
+It does **not** wait for the PHI2 falling edge.
+
+The snapshots include:
+
+- GP0 = PHI2
+- GP1 = /WR
+- GP2..GP9 = D0..D7
+- GP10..GP31 = the physical address wiring used for A0..A19
+
+This lets the PC compare the exact same read event at several timing positions.
+
+## Build / flash
+
+Upload the folder contents to the GitHub repository and run **Build UF2**.
+
+The workflow deliberately uploads:
+
+```text
+build/*.uf2
 ```
-A14 -> GP26 FIXED
-A15 -> GP27 FIXED
+
+so it will not repeat the old artifact-name problem.
+
+Flash the generated:
+
+```text
+snes_rp2350b_timing_sweep.uf2
 ```
 
-means **the mapper determined that this assignment is fixed/certain among the best candidates**. It does *not* mean "wrong" or "needs fixing". In both v1.4 runs the current A14..A17 assignments were already the best mapping.
+## Run
 
-## What changes in v1.5
-
-The old read path built one CPU read from two independent words:
-
-- PIO0: D0-D7 + lower address
-- PIO1: upper address
-
-v1.5 uses a diagnostic path where **one PIO0 instruction captures GP2..GP31 in one ISR word**.
-
-For the 512 KiB Tom & Jerry LoROM, that one word contains all bits needed to compute the physical ROM offset:
-
-- D0-D7
-- A0-A19
-- A15 to identify the upper-half LoROM window
-
-A20-A23 are not needed for a 512 KiB physical ROM offset because those high address bits only select mirrors of the same 512 KiB image.
-
-No wiring changes are required.
-
-## Build
-
-Upload this folder to GitHub and run the included **Build UF2** action. Flash:
-
-`build/snes_rp2350b_single_pio_romdiag.uf2`
-
-Keep the RP2350B powered before the SNES, as before.
-
-## Test
-
-Close PuTTY, RA2Snes and all other COM7 users, then run:
+Close PuTTY, RA2Snes and anything else using COM7.
 
 ```powershell
-python .\atomic_rom_verify.py --port COM7 --rom "C:\Users\flavi\Downloads\RA2Snes-windows-x64\Tom and Jerry (USA).sfc" --seconds 60
+python .\timing_sweep_verify.py --port COM7 --rom "C:\Users\flavi\Downloads\RA2Snes-windows-x64\Tom and Jerry (USA).sfc" --seconds 60
 ```
 
-Play normally for the minute.
+Play normally during the test.
 
-### How to interpret
+Send ChatGPT the complete `--- FINAL TIMING SWEEP ---` table and the `BEST SLOT`.
 
-If `trusted` jumps from the old ~45–50% to roughly 95–100%, the old dual-PIO pairing was the main problem.
+## Interpretation
 
-If it remains around ~45–50%, then pairing is not the explanation; the next suspects are an actual ROM/revision mismatch or a remaining error among the A0-A19 physical mapping.
+- If one slot jumps close to 100%, the old sample timing was the problem.
+- If one slot improves substantially but is not clean, we can make a finer timing
+  scan around that slot.
+- If all eight stay near ~50%, timing alone is not sufficient and the next test
+  should include the full bank-selection context or independently identify/read
+  the physical cartridge ROM.
 
-After this diagnostic, flash the normal RA bridge firmware again before using RA2Snes.
+No wiring changes are required.

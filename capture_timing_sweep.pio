@@ -1,0 +1,42 @@
+.pio_version 1
+.program snes_timing_sweep
+; PIO0, GPIO base = 0
+;
+; Diagnostic timing sweep.
+; PIO2 raises IRQ1 in PIO0 as soon as /RD (GP35) is observed low.
+; PIO0 then takes 8 atomic snapshots of GP0..GP31 from the SAME read event.
+;
+; With autopush threshold 32:
+;   in pins, 32  -> one complete 32-bit sample
+;   nop [2]      -> three PIO clocks before the next IN
+;
+; Therefore consecutive slots are four PIO clocks apart.
+; GP0  = PHI2
+; GP1  = /WR
+; GP2..GP9 = D0..D7
+; GP10..GP31 = physical address wiring / spare GP20
+;
+; We intentionally do NOT wait for a PHI2 edge here. The whole purpose of this
+; firmware is to discover which time window after /RD assertion gives coherent
+; address+data.
+
+.wrap_target
+    wait 1 irq 1
+
+    in pins, 32
+    nop [2]
+    in pins, 32
+    nop [2]
+    in pins, 32
+    nop [2]
+    in pins, 32
+    nop [2]
+    in pins, 32
+    nop [2]
+    in pins, 32
+    nop [2]
+    in pins, 32
+    nop [2]
+    in pins, 32
+    nop [2]
+.wrap
