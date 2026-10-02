@@ -2,12 +2,21 @@
 #include <stdint.h>
 #include "pico/stdlib.h"
 #include "pico/stdio_usb.h"
+#include "hardware/pio.h"
+#include "hardware/dma.h"
 #include "hardware/gpio.h"
+#include "capture_low.pio.h"
+#include "capture_high.pio.h"
 
-#define PIN_PHI2      0
-#define PIN_WR        1
-#define PIN_WR_HI     35
-#define PIN_PHI2_HI   36
+#define PIN_PHI2       0
+#define PIN_WR         1
+#define PIN_DATA_BASE  2
+#define PIN_HIGH_BASE  18
+
+#define SAMPLE_COUNT   64
+
+static uint32_t low_samples[SAMPLE_COUNT];
+static uint32_t high_samples[SAMPLE_COUNT];
 
 static void configure_input(uint pin, bool pull_up) {
     gpio_init(pin);
@@ -16,94 +25,192 @@ static void configure_input(uint pin, bool pull_up) {
     if (pull_up) gpio_pull_up(pin);
 }
 
-typedef struct {
-    uint32_t phi2_edges_lo;
-    uint32_t phi2_edges_hi;
-    uint32_t wr_edges_lo;
-    uint32_t wr_edges_hi;
-    uint32_t wr_low_samples_lo;
-    uint32_t wr_low_samples_hi;
-    uint32_t samples;
-    uint8_t start_phi2_lo, end_phi2_lo;
-    uint8_t start_phi2_hi, end_phi2_hi;
-    uint8_t start_wr_lo, end_wr_lo;
-    uint8_t start_wr_hi, end_wr_hi;
-} diag_t;
+static uint32_t dma_remaining(uint channel) {
+    return dma_channel_hw_addr(channel)->transfer_count & 0x0fffffffu;
+}
 
-static diag_t sample_window_us(uint32_t duration_us) {
-    diag_t d = {0};
-    uint64_t v = gpio_get_all64();
-    uint8_t p0 = (v >> PIN_PHI2) & 1u;
-    uint8_t p36 = (v >> PIN_PHI2_HI) & 1u;
-    uint8_t w1 = (v >> PIN_WR) & 1u;
-    uint8_t w35 = (v >> PIN_WR_HI) & 1u;
+static uint16_t unpack_low16(uint32_t raw) {
+    // SHIFT_RIGHT + IN PINS,16 -> captured bits occupy 31:16.
+    return (uint16_t)(raw >> 16);
+}
 
-    d.start_phi2_lo = p0;
-    d.start_phi2_hi = p36;
-    d.start_wr_lo = w1;
-    d.start_wr_hi = w35;
+static uint32_t unpack_high17(uint32_t raw) {
+    // SHIFT_RIGHT + IN PINS,17 -> captured bits occupy 31:15.
+    return (raw >> 15) & 0x1ffffu;
+}
 
-    uint64_t deadline = time_us_64() + duration_us;
-    while (time_us_64() < deadline) {
-        v = gpio_get_all64();
-        uint8_t n0 = (v >> PIN_PHI2) & 1u;
-        uint8_t n36 = (v >> PIN_PHI2_HI) & 1u;
-        uint8_t n1 = (v >> PIN_WR) & 1u;
-        uint8_t n35 = (v >> PIN_WR_HI) & 1u;
+static uint32_t reconstruct_address(uint16_t low16, uint32_t high17) {
+    uint32_t a0_a7 = (low16 >> 8) & 0xffu;
 
-        d.phi2_edges_lo += (n0 != p0);
-        d.phi2_edges_hi += (n36 != p36);
-        d.wr_edges_lo += (n1 != w1);
-        d.wr_edges_hi += (n35 != w35);
-        d.wr_low_samples_lo += !n1;
-        d.wr_low_samples_hi += !n35;
-        d.samples++;
+    // high17 layout, LSB first:
+    // bit 0 = GP18 = A8
+    // bit 1 = GP19 = A9
+    // bit 2 = GP20 = dummy
+    // bits 3..16 = GP21..34 = A10..A23
+    uint32_t a8_a9 = high17 & 0x3u;
+    uint32_t a10_a23 = (high17 >> 3) & 0x3fffu;
+    uint32_t a8_a23 = a8_a9 | (a10_a23 << 2);
 
-        p0 = n0;
-        p36 = n36;
-        w1 = n1;
-        w35 = n35;
-    }
+    return a0_a7 | (a8_a23 << 8);
+}
 
-    d.end_phi2_lo = p0;
-    d.end_phi2_hi = p36;
-    d.end_wr_lo = w1;
-    d.end_wr_hi = w35;
-    return d;
+static void arm_dma_channel(int channel, const dma_channel_config *cfg,
+                            volatile void *write_addr, const volatile void *read_addr) {
+    dma_channel_configure(channel, cfg, write_addr, read_addr, SAMPLE_COUNT, false);
 }
 
 int main(void) {
     stdio_init_all();
-    while (!stdio_usb_connected()) sleep_ms(50);
-    sleep_ms(200);
 
-    configure_input(PIN_PHI2, false);
-    configure_input(PIN_WR, true);
-    configure_input(PIN_WR_HI, true);
-    configure_input(PIN_PHI2_HI, false);
+    while (!stdio_usb_connected()) {
+        sleep_ms(50);
+    }
+    sleep_ms(250);
 
-    printf("\n=== SNES RP2350B SIO SIGNAL DIAGNOSTIC v0.5.2 ===\n");
-    printf("This version DOES NOT use PIO or DMA. It only watches the raw GPIO pads.\n");
-    printf("Expected: GP0=PHI2, GP1=/WR, GP36=PHI2 jumper copy, GP35=/WR jumper copy.\n");
-    printf("Keep RP2350B powered before the SNES. Turn the SNES on now.\n\n");
+    printf("\n=== SNES RP2350B capture v0.6 - NO JUMPERS ===\n");
+    printf("PHI2=GP0, /WR=GP1, D0-D7=GP2-9, A0-A9=GP10-19, GP20 skipped, A10-A23=GP21-34.\n");
+    printf("Cross-PIO synchronization uses RP2350 IRQ NEXT internally; GP35/GP36 are not used.\n");
+    printf("Keep the RP2350B powered before powering the SNES.\n\n");
     fflush(stdout);
 
-    uint64_t iter = 0;
-    while (true) {
-        ++iter;
-        diag_t d = sample_window_us(100000); // 100 ms busy sample window
+    // All SNES bus pins are inputs only. GP20 is a dummy bit inside the high
+    // capture span; route it to PIO1 too, but never drive it.
+    for (uint pin = 0; pin <= 34; ++pin) {
+        configure_input(pin, pin == PIN_WR);
+    }
 
-        double wr_low_pct_lo = d.samples ? (100.0 * d.wr_low_samples_lo / d.samples) : 0.0;
-        double wr_low_pct_hi = d.samples ? (100.0 * d.wr_low_samples_hi / d.samples) : 0.0;
+    // ---------- PIO0: timing + D0-D7 + A0-A7 ----------
+    PIO pio_lo = pio0;
+    const uint sm_lo = 0;
+    int base_lo_rc = pio_set_gpio_base(pio_lo, 0);
 
-        printf("#%llu  100ms samples=%lu\n", (unsigned long long)iter, (unsigned long)d.samples);
-        printf(" PHI2: GP0 edges=%lu (%u->%u) | GP36 edges=%lu (%u->%u)\n",
-               (unsigned long)d.phi2_edges_lo, d.start_phi2_lo, d.end_phi2_lo,
-               (unsigned long)d.phi2_edges_hi, d.start_phi2_hi, d.end_phi2_hi);
-        printf(" /WR : GP1 edges=%lu low=%.2f%% (%u->%u) | GP35 edges=%lu low=%.2f%% (%u->%u)\n\n",
-               (unsigned long)d.wr_edges_lo, wr_low_pct_lo, d.start_wr_lo, d.end_wr_lo,
-               (unsigned long)d.wr_edges_hi, wr_low_pct_hi, d.start_wr_hi, d.end_wr_hi);
+    for (uint pin = 0; pin <= 17; ++pin) pio_gpio_init(pio_lo, pin);
+    pio_sm_set_consecutive_pindirs(pio_lo, sm_lo, 0, 18, false);
+
+    uint off_lo = pio_add_program(pio_lo, &snes_capture_low_program);
+    pio_sm_config c_lo = snes_capture_low_program_get_default_config(off_lo);
+    sm_config_set_in_pins(&c_lo, PIN_DATA_BASE);
+    sm_config_set_jmp_pin(&c_lo, PIN_WR);
+    sm_config_set_in_shift(&c_lo, true, false, 32);
+    sm_config_set_fifo_join(&c_lo, PIO_FIFO_JOIN_RX);
+    int init_lo_rc = pio_sm_init(pio_lo, sm_lo, off_lo, &c_lo);
+
+    // ---------- PIO1: A8-A23 ----------
+    PIO pio_hi = pio1;
+    const uint sm_hi = 0;
+    int base_hi_rc = pio_set_gpio_base(pio_hi, 16);
+
+    for (uint pin = 18; pin <= 34; ++pin) pio_gpio_init(pio_hi, pin);
+    pio_sm_set_consecutive_pindirs(pio_hi, sm_hi, 18, 17, false);
+
+    uint off_hi = pio_add_program(pio_hi, &snes_capture_high_program);
+    pio_sm_config c_hi = snes_capture_high_program_get_default_config(off_hi);
+    sm_config_set_in_pins(&c_hi, PIN_HIGH_BASE);
+    sm_config_set_in_shift(&c_hi, true, false, 32);
+    sm_config_set_fifo_join(&c_hi, PIO_FIFO_JOIN_RX);
+    int init_hi_rc = pio_sm_init(pio_hi, sm_hi, off_hi, &c_hi);
+
+    printf("PIO init: base_lo=%d init_lo=%d | base_hi=%d init_hi=%d\n",
+           base_lo_rc, init_lo_rc, base_hi_rc, init_hi_rc);
+    if (base_lo_rc || init_lo_rc || base_hi_rc || init_hi_rc) {
+        printf("ERROR: PIO configuration failed. Leave the SNES off.\n");
         fflush(stdout);
-        sleep_ms(400);
+        while (true) sleep_ms(1000);
+    }
+
+    int dma_lo = dma_claim_unused_channel(true);
+    int dma_hi = dma_claim_unused_channel(true);
+
+    dma_channel_config dc_lo = dma_channel_get_default_config(dma_lo);
+    channel_config_set_transfer_data_size(&dc_lo, DMA_SIZE_32);
+    channel_config_set_read_increment(&dc_lo, false);
+    channel_config_set_write_increment(&dc_lo, true);
+    channel_config_set_dreq(&dc_lo, pio_get_dreq(pio_lo, sm_lo, false));
+
+    dma_channel_config dc_hi = dma_channel_get_default_config(dma_hi);
+    channel_config_set_transfer_data_size(&dc_hi, DMA_SIZE_32);
+    channel_config_set_read_increment(&dc_hi, false);
+    channel_config_set_write_increment(&dc_hi, true);
+    channel_config_set_dreq(&dc_hi, pio_get_dreq(pio_hi, sm_hi, false));
+
+    printf("READY. Turn the SNES on now.\n");
+    printf("This diagnostic captures 64 writes, prints them, then automatically rearms forever.\n\n");
+    fflush(stdout);
+
+    uint32_t batch = 0;
+
+    while (true) {
+        ++batch;
+
+        pio_sm_set_enabled(pio_lo, sm_lo, false);
+        pio_sm_set_enabled(pio_hi, sm_hi, false);
+        pio_sm_restart(pio_lo, sm_lo);
+        pio_sm_restart(pio_hi, sm_hi);
+        pio_sm_clear_fifos(pio_lo, sm_lo);
+        pio_sm_clear_fifos(pio_hi, sm_hi);
+
+        // Clear any stale IRQ0 in PIO1 before rearming the pair.
+        pio_interrupt_clear(pio_hi, 0);
+
+        arm_dma_channel(dma_lo, &dc_lo, low_samples, &pio_lo->rxf[sm_lo]);
+        arm_dma_channel(dma_hi, &dc_hi, high_samples, &pio_hi->rxf[sm_hi]);
+        dma_start_channel_mask((1u << dma_lo) | (1u << dma_hi));
+
+        // Start the receiver first so it is already waiting when PIO0 signals it.
+        pio_sm_set_enabled(pio_hi, sm_hi, true);
+        pio_sm_set_enabled(pio_lo, sm_lo, true);
+
+        uint32_t last_lo = SAMPLE_COUNT + 1;
+        uint32_t last_hi = SAMPLE_COUNT + 1;
+        uint32_t heartbeat = 0;
+
+        while (true) {
+            uint32_t rem_lo = dma_remaining(dma_lo);
+            uint32_t rem_hi = dma_remaining(dma_hi);
+
+            if (rem_lo == 0 && rem_hi == 0) break;
+
+            if (rem_lo != last_lo || rem_hi != last_hi) {
+                printf("batch %lu progress: LOW %lu/%d HIGH %lu/%d\n",
+                       (unsigned long)batch,
+                       (unsigned long)(SAMPLE_COUNT - rem_lo), SAMPLE_COUNT,
+                       (unsigned long)(SAMPLE_COUNT - rem_hi), SAMPLE_COUNT);
+                last_lo = rem_lo;
+                last_hi = rem_hi;
+            } else if ((heartbeat++ % 4u) == 0u) {
+                printf("batch %lu heartbeat: LOW %lu/%d HIGH %lu/%d\n",
+                       (unsigned long)batch,
+                       (unsigned long)(SAMPLE_COUNT - rem_lo), SAMPLE_COUNT,
+                       (unsigned long)(SAMPLE_COUNT - rem_hi), SAMPLE_COUNT);
+            }
+            fflush(stdout);
+            sleep_ms(250);
+        }
+
+        pio_sm_set_enabled(pio_lo, sm_lo, false);
+        pio_sm_set_enabled(pio_hi, sm_hi, false);
+
+        printf("\n--- batch %lu: %d paired write cycles ---\n",
+               (unsigned long)batch, SAMPLE_COUNT);
+
+        for (int i = 0; i < SAMPLE_COUNT; ++i) {
+            uint16_t low16 = unpack_low16(low_samples[i]);
+            uint32_t high17 = unpack_high17(high_samples[i]);
+            uint8_t data = (uint8_t)(low16 & 0xffu);
+            uint32_t address = reconstruct_address(low16, high17) & 0xffffffu;
+            uint8_t bank = (uint8_t)(address >> 16);
+            uint16_t addr = (uint16_t)address;
+
+            printf("WRITE $%02X:%04X = %02X", bank, addr, data);
+            if (bank == 0x7e || bank == 0x7f) {
+                uint32_t wram_offset = ((uint32_t)(bank - 0x7e) << 16) | addr;
+                printf("   [WRAM +0x%05lX]", (unsigned long)wram_offset);
+            }
+            printf("\n");
+        }
+
+        printf("--- end batch %lu; rearming ---\n\n", (unsigned long)batch);
+        fflush(stdout);
+        sleep_ms(100);
     }
 }
