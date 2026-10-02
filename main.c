@@ -16,8 +16,8 @@
 #include "capture_read_trigger.pio.h"
 
 #define PIN_RD          35
-#define SLOT_COUNT      8u
-#define EVENT_COUNT     32u
+#define SLOT_COUNT      16u
+#define EVENT_COUNT     16u
 #define WORD_COUNT      (SLOT_COUNT * EVENT_COUNT)   // 256 DMA words
 #define CMD_BUF_SIZE    128
 #define TRACE_MAX       4096u
@@ -159,10 +159,10 @@ int main(void) {
     while (!stdio_usb_connected()) sleep_ms(50);
     sleep_ms(250);
 
-    printf("\n=== SNES RP2350B v1.6 TIMING SWEEP ===\n");
+    printf("\n=== SNES RP2350B v1.7 WIDE TIMING SWEEP ===\n");
     printf("Diagnostic-only firmware. No wiring changes required.\n");
-    printf("Each /RD event produces 8 atomic GP0..GP31 snapshots.\n");
-    printf("Consecutive slots are four PIO clocks apart (IN + NOP[2]).\n");
+    printf("Each /RD event produces 16 atomic GP0..GP31 snapshots.\n");
+    printf("Capture SM clkdiv=2; consecutive slots are ~53 ns apart at 150 MHz.\n");
     printf("GP0=PHI2 GP1=/WR GP2-9=D0-7; GP10-31 include A0-A19 wiring.\n");
     printf("Keep RP2350B powered before SNES. Type HELP for commands.\n\n");
     fflush(stdout);
@@ -180,10 +180,11 @@ int main(void) {
     for (uint pin = 0; pin <= 31; ++pin) pio_gpio_init(pio_cap, pin);
     pio_sm_set_consecutive_pindirs(pio_cap, sm_cap, 0, 32, false);
 
-    uint off_cap = pio_add_program(pio_cap, &snes_timing_sweep_program);
-    pio_sm_config c_cap = snes_timing_sweep_program_get_default_config(off_cap);
+    uint off_cap = pio_add_program(pio_cap, &snes_wide_timing_sweep_program);
+    pio_sm_config c_cap = snes_wide_timing_sweep_program_get_default_config(off_cap);
     sm_config_set_in_pins(&c_cap, 0);
     sm_config_set_in_shift(&c_cap, true, true, 32); // autopush each IN PINS,32
+    sm_config_set_clkdiv(&c_cap, 2.0f); // wide sweep: ~53.3 ns between slots at 150 MHz sysclk
     sm_config_set_fifo_join(&c_cap, PIO_FIFO_JOIN_RX);
     int init_cap_rc = pio_sm_init(pio_cap, sm_cap, off_cap, &c_cap);
 
@@ -231,7 +232,7 @@ int main(void) {
     pio_sm_set_enabled(pio_cap, sm_cap, true);
     pio_sm_set_enabled(pio_rd, sm_rd, true);
 
-    printf("READY. Run timing_sweep_verify.py from the PC.\n\n");
+    printf("READY. Run wide_timing_sweep_verify.py from the PC.\n\n");
     fflush(stdout);
 
     while (true) {

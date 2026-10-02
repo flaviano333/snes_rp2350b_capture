@@ -1,28 +1,16 @@
 .pio_version 1
-.program snes_timing_sweep
-; PIO0, GPIO base = 0
+.program snes_wide_timing_sweep
+; PIO0 GPIO window 0..31.
+; Triggered by PIO0 IRQ1 from the /RD watcher.
 ;
-; Diagnostic timing sweep.
-; PIO2 raises IRQ1 in PIO0 as soon as /RD (GP35) is observed low.
-; PIO0 then takes 8 atomic snapshots of GP0..GP31 from the SAME read event.
-;
-; With autopush threshold 32:
-;   in pins, 32  -> one complete 32-bit sample
-;   nop [2]      -> three PIO clocks before the next IN
-;
-; Therefore consecutive slots are four PIO clocks apart.
-; GP0  = PHI2
-; GP1  = /WR
-; GP2..GP9 = D0..D7
-; GP10..GP31 = physical address wiring / spare GP20
-;
-; We intentionally do NOT wait for a PHI2 edge here. The whole purpose of this
-; firmware is to discover which time window after /RD assertion gives coherent
-; address+data.
+; 16 atomic GP0..GP31 samples.
+; Capture SM runs at clkdiv=2.0.
+; Between sample starts: IN(1 cycle) + NOP[2](3 cycles) = 4 PIO cycles
+; = 8 system clocks. At the normal 150 MHz sys clock this is ~53.3 ns.
+; S0..S15 therefore span ~800 ns, wide enough to cross PHI2 transitions.
 
 .wrap_target
     wait 1 irq 1
-
     in pins, 32
     nop [2]
     in pins, 32
@@ -39,4 +27,19 @@
     nop [2]
     in pins, 32
     nop [2]
+    in pins, 32
+    nop [2]
+    in pins, 32
+    nop [2]
+    in pins, 32
+    nop [2]
+    in pins, 32
+    nop [2]
+    in pins, 32
+    nop [2]
+    in pins, 32
+    nop [2]
+    in pins, 32
+    nop [2]
+    in pins, 32
 .wrap
