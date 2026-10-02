@@ -2,7 +2,10 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
+#include <stdlib.h>
+#include <ctype.h>
 #include "pico/stdlib.h"
+#include "pico/stdio.h"
 #include "pico/stdio_usb.h"
 #include "hardware/pio.h"
 #include "hardware/dma.h"
@@ -15,19 +18,28 @@
 #define PIN_DATA_BASE  2
 #define PIN_HIGH_BASE  18
 
-// Larger batches make it easier to catch WRAM writes while still keeping
-// the implementation simple and deterministic.
 #define SAMPLE_COUNT   256
 #define WRAM_SIZE      (128u * 1024u)
+#define VALID_SIZE     (WRAM_SIZE / 8u)
+#define CMD_BUF_SIZE   128
 
 static uint32_t low_samples[SAMPLE_COUNT];
 static uint32_t high_samples[SAMPLE_COUNT];
 
-// Partial software mirror of WRAM. A byte becomes "known" only after this
-// adapter has actually observed a write to it.
+// Passive WRAM mirror. A byte is marked valid only after this adapter
+// has actually observed a write to it.
 static uint8_t wram[WRAM_SIZE];
-static uint8_t wram_valid[WRAM_SIZE / 8u];
+static uint8_t wram_valid[VALID_SIZE];
 static uint32_t known_wram_bytes = 0;
+
+static uint64_t total_bus_writes = 0;
+static uint64_t total_wram_writes = 0;
+static uint64_t total_direct_writes = 0;
+static uint64_t total_mirror_writes = 0;
+static uint32_t completed_batches = 0;
+
+static char cmd_buf[CMD_BUF_SIZE];
+static size_t cmd_len = 0;
 
 static void configure_input(uint pin, bool pull_up) {
     gpio_init(pin);
@@ -41,27 +53,18 @@ static uint32_t dma_remaining(uint channel) {
 }
 
 static uint16_t unpack_low16(uint32_t raw) {
-    // SHIFT_RIGHT + IN PINS,16 -> captured bits occupy 31:16.
     return (uint16_t)(raw >> 16);
 }
 
 static uint32_t unpack_high17(uint32_t raw) {
-    // SHIFT_RIGHT + IN PINS,17 -> captured bits occupy 31:15.
     return (raw >> 15) & 0x1ffffu;
 }
 
 static uint32_t reconstruct_address(uint16_t low16, uint32_t high17) {
     uint32_t a0_a7 = (low16 >> 8) & 0xffu;
-
-    // high17 layout, LSB first:
-    // bit 0 = GP18 = A8
-    // bit 1 = GP19 = A9
-    // bit 2 = GP20 = dummy
-    // bits 3..16 = GP21..34 = A10..A23
     uint32_t a8_a9 = high17 & 0x3u;
     uint32_t a10_a23 = (high17 >> 3) & 0x3fffu;
     uint32_t a8_a23 = a8_a9 | (a10_a23 << 2);
-
     return a0_a7 | (a8_a23 << 8);
 }
 
@@ -70,21 +73,17 @@ static void arm_dma_channel(int channel, const dma_channel_config *cfg,
     dma_channel_configure(channel, cfg, write_addr, read_addr, SAMPLE_COUNT, false);
 }
 
-// Returns true if a 24-bit SNES A-bus address maps to WRAM.
-// offset is the canonical 0x00000-0x1FFFF WRAM offset.
-// direct is true for banks 7E/7F and false for the 8 KiB mirrors.
+// Translate a 24-bit SNES A-bus address to the canonical WRAM offset.
 static bool map_address_to_wram(uint32_t address, uint32_t *offset, bool *direct) {
     uint8_t bank = (uint8_t)(address >> 16);
     uint16_t addr = (uint16_t)address;
 
-    // Full 128 KiB WRAM mapping.
     if (bank == 0x7e || bank == 0x7f) {
         *offset = ((uint32_t)(bank - 0x7e) << 16) | addr;
         *direct = true;
         return true;
     }
 
-    // First 8 KiB mirrored into banks 00-3F and 80-BF.
     bool mirror_bank = (bank <= 0x3f) || (bank >= 0x80 && bank <= 0xbf);
     if (mirror_bank && addr <= 0x1fffu) {
         *offset = addr;
@@ -108,6 +107,264 @@ static void mark_wram_known(uint32_t offset) {
     }
 }
 
+static bool parse_hex_u32(const char *s, uint32_t *out) {
+    if (!s || !*s) return false;
+    while (*s == ' ' || *s == '\t') ++s;
+    if (*s == '$') ++s;
+    if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) s += 2;
+    if (!isxdigit((unsigned char)*s)) return false;
+
+    char *end = NULL;
+    unsigned long v = strtoul(s, &end, 16);
+    if (end == s) return false;
+    while (*end == ' ' || *end == '\t') ++end;
+    if (*end != '\0') return false;
+    *out = (uint32_t)v;
+    return true;
+}
+
+static void strtoupper_inplace(char *s) {
+    while (*s) {
+        *s = (char)toupper((unsigned char)*s);
+        ++s;
+    }
+}
+
+static void print_help(void) {
+    printf("Commands:\n");
+    printf("  HELP                    show this help\n");
+    printf("  INFO                    capture/mirror statistics\n");
+    printf("  READ <offset>           read canonical WRAM offset 00000-1FFFF\n");
+    printf("  READSNES <BB:AAAA>      read a SNES address if it maps to WRAM\n");
+    printf("  HEX [offset] [length]   human-readable WRAM dump (max 4096 bytes)\n");
+    printf("  DUMPBIN                 binary snapshot: 128 KiB WRAM + 16 KiB valid bitmap\n");
+    printf("  CLEAR                   clear the software mirror/known bitmap\n");
+    printf("  PING                    reply PONG\n");
+}
+
+static void print_info(void) {
+    printf("INFO batches=%lu bus_writes=%llu wram_writes=%llu direct=%llu mirror=%llu known=%lu/%u (%.2f%%)\n",
+           (unsigned long)completed_batches,
+           (unsigned long long)total_bus_writes,
+           (unsigned long long)total_wram_writes,
+           (unsigned long long)total_direct_writes,
+           (unsigned long long)total_mirror_writes,
+           (unsigned long)known_wram_bytes,
+           (unsigned)WRAM_SIZE,
+           (double)known_wram_bytes * 100.0 / (double)WRAM_SIZE);
+}
+
+static void command_read_offset(const char *arg) {
+    uint32_t off;
+    if (!parse_hex_u32(arg, &off) || off >= WRAM_SIZE) {
+        printf("ERR READ expects hexadecimal offset 00000-1FFFF\n");
+        return;
+    }
+
+    if (wram_byte_known(off)) {
+        printf("READ %05lX = %02X KNOWN\n", (unsigned long)off, wram[off]);
+    } else {
+        printf("READ %05lX = ?? UNKNOWN\n", (unsigned long)off);
+    }
+}
+
+static void command_read_snes(const char *arg) {
+    if (!arg) {
+        printf("ERR READSNES expects BB:AAAA, e.g. 00:13FB or 7E:1234\n");
+        return;
+    }
+
+    char temp[32];
+    strncpy(temp, arg, sizeof(temp) - 1);
+    temp[sizeof(temp) - 1] = '\0';
+    char *colon = strchr(temp, ':');
+    if (!colon) {
+        printf("ERR READSNES expects BB:AAAA\n");
+        return;
+    }
+    *colon = '\0';
+
+    uint32_t bank, addr;
+    if (!parse_hex_u32(temp, &bank) || !parse_hex_u32(colon + 1, &addr) || bank > 0xffu || addr > 0xffffu) {
+        printf("ERR READSNES expects BB:AAAA in hex\n");
+        return;
+    }
+
+    uint32_t full = (bank << 16) | addr;
+    uint32_t off;
+    bool direct;
+    if (!map_address_to_wram(full, &off, &direct)) {
+        printf("READSNES $%02lX:%04lX = NOT_WRAM\n", (unsigned long)bank, (unsigned long)addr);
+        return;
+    }
+
+    if (wram_byte_known(off)) {
+        printf("READSNES $%02lX:%04lX -> WRAM %05lX = %02X KNOWN %s\n",
+               (unsigned long)bank, (unsigned long)addr, (unsigned long)off,
+               wram[off], direct ? "DIRECT" : "MIRROR");
+    } else {
+        printf("READSNES $%02lX:%04lX -> WRAM %05lX = ?? UNKNOWN %s\n",
+               (unsigned long)bank, (unsigned long)addr, (unsigned long)off,
+               direct ? "DIRECT" : "MIRROR");
+    }
+}
+
+static void command_hex(char *args) {
+    uint32_t start = 0;
+    uint32_t len = 256;
+
+    if (args && *args) {
+        char *a = strtok(args, " \t");
+        char *b = strtok(NULL, " \t");
+        if (a && !parse_hex_u32(a, &start)) {
+            printf("ERR HEX offset must be hexadecimal\n");
+            return;
+        }
+        if (b && !parse_hex_u32(b, &len)) {
+            printf("ERR HEX length must be hexadecimal\n");
+            return;
+        }
+    }
+
+    if (start >= WRAM_SIZE) {
+        printf("ERR HEX offset out of range\n");
+        return;
+    }
+    if (len == 0) len = 1;
+    if (len > 4096) len = 4096;
+    if (start + len > WRAM_SIZE) len = WRAM_SIZE - start;
+
+    printf("HEX %05lX %lX\n", (unsigned long)start, (unsigned long)len);
+    for (uint32_t row = 0; row < len; row += 16) {
+        uint32_t off = start + row;
+        printf("%05lX:", (unsigned long)off);
+        uint32_t row_len = (len - row > 16) ? 16 : (len - row);
+        for (uint32_t i = 0; i < row_len; ++i) {
+            uint32_t p = off + i;
+            if (wram_byte_known(p)) printf(" %02X", wram[p]);
+            else printf(" ??");
+        }
+        printf("\n");
+    }
+    printf("ENDHEX\n");
+}
+
+static void command_dumpbin(void) {
+    // Machine-readable framing. Raw payload is sent with CR/LF translation disabled.
+    // Payload = 131072 WRAM bytes + 16384 validity-bitmap bytes.
+    printf("BIN1 %u %u %lu %lu\n",
+           (unsigned)WRAM_SIZE,
+           (unsigned)VALID_SIZE,
+           (unsigned long)known_wram_bytes,
+           (unsigned long)completed_batches);
+    fflush(stdout);
+
+    const size_t chunk = 1024;
+    for (size_t off = 0; off < WRAM_SIZE; off += chunk) {
+        size_t n = WRAM_SIZE - off;
+        if (n > chunk) n = chunk;
+        stdio_put_string((const char *)&wram[off], (int)n, false, false);
+    }
+    for (size_t off = 0; off < VALID_SIZE; off += chunk) {
+        size_t n = VALID_SIZE - off;
+        if (n > chunk) n = chunk;
+        stdio_put_string((const char *)&wram_valid[off], (int)n, false, false);
+    }
+    stdio_flush();
+    printf("\nEND BIN1\n");
+    fflush(stdout);
+}
+
+static void execute_command(char *line) {
+    while (*line == ' ' || *line == '\t') ++line;
+    if (!*line) return;
+
+    char *cmd = line;
+    char *rest = line;
+    while (*rest && *rest != ' ' && *rest != '\t') ++rest;
+    if (*rest) {
+        *rest++ = '\0';
+        while (*rest == ' ' || *rest == '\t') ++rest;
+        if (!*rest) rest = NULL;
+    } else {
+        rest = NULL;
+    }
+    strtoupper_inplace(cmd);
+
+    if (!strcmp(cmd, "HELP") || !strcmp(cmd, "?")) {
+        print_help();
+    } else if (!strcmp(cmd, "INFO")) {
+        print_info();
+    } else if (!strcmp(cmd, "PING")) {
+        printf("PONG\n");
+    } else if (!strcmp(cmd, "READ")) {
+        command_read_offset(rest);
+    } else if (!strcmp(cmd, "READSNES")) {
+        command_read_snes(rest);
+    } else if (!strcmp(cmd, "HEX")) {
+        command_hex(rest);
+    } else if (!strcmp(cmd, "DUMPBIN")) {
+        command_dumpbin();
+    } else if (!strcmp(cmd, "CLEAR")) {
+        memset(wram, 0, sizeof(wram));
+        memset(wram_valid, 0, sizeof(wram_valid));
+        known_wram_bytes = 0;
+        printf("OK mirror cleared\n");
+    } else {
+        printf("ERR unknown command '%s' (type HELP)\n", cmd);
+    }
+    fflush(stdout);
+}
+
+static void poll_serial_commands(void) {
+    while (true) {
+        int c = getchar_timeout_us(0);
+        if (c == PICO_ERROR_TIMEOUT) break;
+
+        if (c == '\r' || c == '\n') {
+            if (cmd_len) {
+                cmd_buf[cmd_len] = '\0';
+                execute_command(cmd_buf);
+                cmd_len = 0;
+            }
+            continue;
+        }
+
+        if (c == 8 || c == 127) {
+            if (cmd_len) --cmd_len;
+            continue;
+        }
+
+        if (cmd_len + 1 < CMD_BUF_SIZE && c >= 32 && c <= 126) {
+            cmd_buf[cmd_len++] = (char)c;
+        }
+    }
+}
+
+static void process_capture_batch(void) {
+    ++completed_batches;
+
+    for (int i = 0; i < SAMPLE_COUNT; ++i) {
+        uint16_t low16 = unpack_low16(low_samples[i]);
+        uint32_t high17 = unpack_high17(high_samples[i]);
+        uint8_t data = (uint8_t)(low16 & 0xffu);
+        uint32_t address = reconstruct_address(low16, high17) & 0xffffffu;
+
+        ++total_bus_writes;
+
+        uint32_t wram_offset;
+        bool direct;
+        if (!map_address_to_wram(address, &wram_offset, &direct)) continue;
+
+        ++total_wram_writes;
+        if (direct) ++total_direct_writes;
+        else ++total_mirror_writes;
+
+        wram[wram_offset] = data;
+        mark_wram_known(wram_offset);
+    }
+}
+
 int main(void) {
     stdio_init_all();
 
@@ -119,11 +376,12 @@ int main(void) {
     memset(wram, 0, sizeof(wram));
     memset(wram_valid, 0, sizeof(wram_valid));
 
-    printf("\n=== SNES RP2350B WRAM capture v0.7 - NO JUMPERS ===\n");
-    printf("PHI2=GP0, /WR=GP1, D0-D7=GP2-9, A0-A9=GP10-19, GP20 skipped, A10-A23=GP21-34.\n");
-    printf("Only writes that map to SNES WRAM are printed.\n");
-    printf("The 128 KiB software mirror is PARTIAL: a byte becomes known only after an observed write.\n");
-    printf("Keep the RP2350B powered before powering the SNES.\n\n");
+    printf("\n=== SNES RP2350B WRAM Bridge v0.8 ===\n");
+    printf("Passive A-bus monitor; no GP35/GP36 jumpers.\n");
+    printf("PHI2=GP0 /WR=GP1 D0-D7=GP2-9 A0-A9=GP10-19 GP20 skipped A10-A23=GP21-34.\n");
+    printf("The 128 KiB mirror is PARTIAL: only observed writes are marked KNOWN.\n");
+    printf("Keep the RP2350B powered before powering the SNES.\n");
+    printf("Type HELP for commands.\n\n");
     fflush(stdout);
 
     for (uint pin = 0; pin <= 34; ++pin) {
@@ -166,7 +424,10 @@ int main(void) {
     if (base_lo_rc || init_lo_rc || base_hi_rc || init_hi_rc) {
         printf("ERROR: PIO configuration failed. Leave the SNES off.\n");
         fflush(stdout);
-        while (true) sleep_ms(1000);
+        while (true) {
+            poll_serial_commands();
+            sleep_ms(10);
+        }
     }
 
     int dma_lo = dma_claim_unused_channel(true);
@@ -184,17 +445,11 @@ int main(void) {
     channel_config_set_write_increment(&dc_hi, true);
     channel_config_set_dreq(&dc_hi, pio_get_dreq(pio_hi, sm_hi, false));
 
-    printf("READY. Turn the SNES on now.\n");
-    printf("Capturing continuously in batches of %d bus writes.\n\n", SAMPLE_COUNT);
+    printf("READY. Capture runs quietly in the background.\n");
+    printf("Use INFO, READ, READSNES, HEX or DUMPBIN.\n\n");
     fflush(stdout);
 
-    uint32_t batch = 0;
-    uint64_t total_bus_writes = 0;
-    uint64_t total_wram_writes = 0;
-
     while (true) {
-        ++batch;
-
         pio_sm_set_enabled(pio_lo, sm_lo, false);
         pio_sm_set_enabled(pio_hi, sm_hi, false);
         pio_sm_restart(pio_lo, sm_lo);
@@ -211,76 +466,14 @@ int main(void) {
         pio_sm_set_enabled(pio_lo, sm_lo, true);
 
         while (dma_remaining(dma_lo) != 0 || dma_remaining(dma_hi) != 0) {
-            sleep_ms(1);
+            poll_serial_commands();
+            sleep_us(100);
         }
 
         pio_sm_set_enabled(pio_lo, sm_lo, false);
         pio_sm_set_enabled(pio_hi, sm_hi, false);
 
-        uint32_t direct_count = 0;
-        uint32_t mirror_count = 0;
-        uint32_t other_count = 0;
-        uint32_t new_known = 0;
-
-        printf("\n--- batch %lu ---\n", (unsigned long)batch);
-
-        for (int i = 0; i < SAMPLE_COUNT; ++i) {
-            uint16_t low16 = unpack_low16(low_samples[i]);
-            uint32_t high17 = unpack_high17(high_samples[i]);
-            uint8_t data = (uint8_t)(low16 & 0xffu);
-            uint32_t address = reconstruct_address(low16, high17) & 0xffffffu;
-
-            ++total_bus_writes;
-
-            uint32_t wram_offset;
-            bool direct;
-            if (!map_address_to_wram(address, &wram_offset, &direct)) {
-                ++other_count;
-                continue;
-            }
-
-            ++total_wram_writes;
-            if (direct) ++direct_count;
-            else ++mirror_count;
-
-            bool was_known = wram_byte_known(wram_offset);
-            uint8_t old_value = wram[wram_offset];
-            wram[wram_offset] = data;
-            mark_wram_known(wram_offset);
-            if (!was_known) ++new_known;
-
-            uint8_t bank = (uint8_t)(address >> 16);
-            uint16_t addr = (uint16_t)address;
-
-            printf("WRAM $%05lX <- %02X   via $%02X:%04X %s",
-                   (unsigned long)wram_offset,
-                   data,
-                   bank,
-                   addr,
-                   direct ? "direct" : "mirror");
-
-            if (was_known && old_value == data) {
-                printf(" (same)");
-            } else if (was_known) {
-                printf(" (was %02X)", old_value);
-            } else {
-                printf(" (first seen)");
-            }
-            printf("\n");
-        }
-
-        printf("summary: direct=%lu mirror=%lu other=%lu new_known=%lu\n",
-               (unsigned long)direct_count,
-               (unsigned long)mirror_count,
-               (unsigned long)other_count,
-               (unsigned long)new_known);
-        printf("totals: bus_writes=%llu wram_writes=%llu known_WRAM=%lu/%u bytes (%.2f%%)\n",
-               (unsigned long long)total_bus_writes,
-               (unsigned long long)total_wram_writes,
-               (unsigned long)known_wram_bytes,
-               (unsigned)WRAM_SIZE,
-               (double)known_wram_bytes * 100.0 / (double)WRAM_SIZE);
-        printf("--- end batch %lu; rearming ---\n", (unsigned long)batch);
-        fflush(stdout);
+        process_capture_batch();
+        poll_serial_commands();
     }
 }

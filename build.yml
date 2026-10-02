@@ -1,14 +1,17 @@
 name: Build UF2
+
 on:
   workflow_dispatch:
   push:
     branches: [ main, master ]
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout project
         uses: actions/checkout@v4
+
       - name: Checkout Pico SDK 2.2.0
         uses: actions/checkout@v4
         with:
@@ -16,18 +19,22 @@ jobs:
           ref: 2.2.0
           path: pico-sdk
           submodules: recursive
+
       - name: Install ARM toolchain and build tools
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build gcc-arm-none-eabi libnewlib-arm-none-eabi
+
       - name: Configure
         env:
           PICO_SDK_PATH: ${{ github.workspace }}/pico-sdk
         run: cmake -S . -B build -G Ninja
+
       - name: Build
         run: cmake --build build
+
       - name: Upload UF2
         uses: actions/upload-artifact@v4
         with:
-          name: snes-rp2350b-sio-diag-v0.5
+          name: snes-rp2350b-wram-bridge-v0.8-uf2
           path: build/snes_rp2350b_capture.uf2
