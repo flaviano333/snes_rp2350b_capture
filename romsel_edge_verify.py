@@ -74,6 +74,47 @@ def send(s, cmd):
     s.write((cmd.rstrip() + "\n").encode("ascii"))
     s.flush()
 
+def verify_firmware(s):
+    """Ask the board for an explicit build ID; abort on an old/wrong UF2."""
+    try:
+        s.reset_input_buffer()
+    except Exception:
+        pass
+    send(s, "INFO")
+    deadline = time.monotonic() + 1.5
+    seen = []
+    while time.monotonic() < deadline:
+        raw = s.readline()
+        if not raw:
+            continue
+        line = raw.decode("ascii", errors="replace").strip()
+        if line:
+            seen.append(line)
+        if line.startswith("INFO "):
+            required = (
+                "version=1.8.2",
+                "rd=GP35",
+                "romsel=GP36",
+                "pio2_base=16",
+                "rd_wait_index=19",
+            )
+            missing = [x for x in required if x not in line]
+            if missing:
+                raise RuntimeError(
+                    "Wrong/old firmware loaded. INFO was:\\n  "
+                    + line
+                    + "\\nMissing expected fields: "
+                    + ", ".join(missing)
+                )
+            print("Firmware handshake OK:")
+            print("  " + line)
+            return
+    raise RuntimeError(
+        "Could not verify firmware with INFO. "
+        "The loaded UF2 may be old/wrong, or COM communication failed. "
+        "Lines seen: " + repr(seen[-5:])
+    )
+
 class Combo:
     def __init__(self, ar, dr):
         self.ar = ar
@@ -151,7 +192,7 @@ def main():
     print(f"Reference: {rom_path.name}")
     print(f"ROM data: {len(rom)} bytes" + (f" (stripped {stripped}-byte header)" if stripped else ""))
     print(f"MD5: {hashlib.md5(rom).hexdigest()}")
-    print("Firmware: v1.8 /ROMSEL-qualified")
+    print("Required firmware: v1.8.2 /ROMSEL-qualified")
     print("Every emitted event is qualified by /RD=0 AND /ROMSEL=0.\n")
 
     combos = {(ar,dr): Combo(ar,dr) for ar in ADDR_RELS for dr in DATA_RELS}
@@ -179,6 +220,7 @@ def main():
             except (SerialException, OSError):
                 reconnects += 1
                 time.sleep(0.5)
+        verify_firmware(ser)
         send(ser, "OFF")
         time.sleep(0.03)
         ser.reset_input_buffer()

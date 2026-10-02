@@ -1,23 +1,25 @@
 .pio_version 1
 .program snes_romsel_read_trigger
-; PIO2, GPIO base = 16
+; RP2350B PIO2 GPIO base = 16.
 ;
-; GP35 = CPU /RD       (active low)
-; GP36 = /ROMSEL       (active low)
+; IMPORTANT:
+;   WAIT GPIO indices are RELATIVE to the PIO GPIO base.
+;   Physical GP35 => 35 - 16 = 19.
+;
+; Physical GP35 = CPU /RD       (active low)
+; Physical GP36 = /ROMSEL       (active low, selected via JMP PIN config)
 ;
 ; Only notify PIO0 for genuine cartridge-ROM read cycles.
-; Explicit "start:" label is used because .wrap_target is a directive,
-; not a jump label.
 
 .wrap_target
 start:
-    wait 0 gpio 35
-    jmp pin non_rom
+    wait 0 gpio 19       ; physical GP35 because PIO2 gpio_base=16
+    jmp pin non_rom      ; configured JMP pin = physical GP36 (/ROMSEL)
     irq next 1
-    wait 1 gpio 35
+    wait 1 gpio 19       ; physical GP35 released
     jmp start
 
 non_rom:
-    wait 1 gpio 35
+    wait 1 gpio 19
     jmp start
 .wrap

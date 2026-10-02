@@ -77,7 +77,7 @@ static void execute_command(char *line) {
         printf("PONG\n");
     } else if (!strcmp(line, "INFO")) {
         uint32_t sys_hz = clock_get_hz(clk_sys);
-        printf("INFO batches=%llu events=%llu trace_events=%lu sys_hz=%lu slots=%u\n",
+        printf("INFO version=1.8.2 rd=GP35 romsel=GP36 pio2_base=16 rd_wait_index=19 batches=%llu events=%llu trace_events=%lu sys_hz=%lu slots=%u\n",
                (unsigned long long)total_batches,
                (unsigned long long)total_events,
                (unsigned long)trace_events_remaining,
@@ -160,7 +160,7 @@ int main(void) {
     while (!stdio_usb_connected()) sleep_ms(50);
     sleep_ms(250);
 
-    printf("\n=== SNES RP2350B v1.8 ROMSEL-QUALIFIED SWEEP ===\n");
+    printf("\n=== SNES RP2350B v1.8.2 ROMSEL-QUALIFIED SWEEP ===\n");
     printf("Diagnostic-only firmware. Requires ONE new wire: SNES /ROMSEL pin 49 -> RP2350 GP36.\n");
     printf("Each qualified /RD + /ROMSEL ROM-read event produces 16 atomic GP0..GP31 snapshots.\n");
     printf("Capture SM clkdiv=2; consecutive slots are ~53 ns apart at 150 MHz.\n");
