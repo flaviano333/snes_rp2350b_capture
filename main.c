@@ -4,6 +4,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <stdarg.h>
 #include "pico/stdlib.h"
 #include "pico/stdio.h"
 #include "pico/stdio_usb.h"
@@ -47,7 +48,19 @@ static uint64_t total_bus_reads = 0;
 static uint64_t total_wram_reads = 0;
 static uint64_t total_direct_reads = 0;
 static uint64_t total_mirror_reads = 0;
+static uint64_t total_wmaddr_reg_writes = 0;
+static uint64_t total_wmdata_writes = 0;
+static uint64_t total_wmdata_reads = 0;
+static uint64_t total_wmdata_reconstructed_writes = 0;
+static uint64_t total_wmdata_reconstructed_reads = 0;
+static uint64_t total_wmdata_unknown_pointer = 0;
 static uint32_t completed_batches = 0;
+
+// CPU-side WRAM port ($2180-$2183) shadow.  The three WMADD registers form
+// a 17-bit pointer.  This is useful when a game accesses WRAM above $1FFF
+// through WMDATA instead of direct $7E/$7F A-bus cycles.
+static uint32_t wmadd_shadow = 0;
+static uint8_t wmadd_known_mask = 0; // bit0=$2181, bit1=$2182, bit2=$2183
 
 static char cmd_buf[CMD_BUF_SIZE];
 static size_t cmd_len = 0;
@@ -66,7 +79,8 @@ typedef enum {
     DEBUG_ALL,
     DEBUG_WRAM,
     DEBUG_READ,
-    DEBUG_WRITE
+    DEBUG_WRITE,
+    DEBUG_WMDATA
 } debug_mode_t;
 
 static debug_mode_t debug_mode = DEBUG_OFF;
@@ -75,6 +89,7 @@ static uint64_t bank_write_counts[256];
 static uint64_t bank_read_counts[256];
 
 static void strtoupper_inplace(char *s);
+static void mark_wram_known(uint32_t offset);
 
 static void configure_input(uint pin, bool pull_up) {
     gpio_init(pin);
@@ -147,6 +162,7 @@ static const char *debug_mode_name(debug_mode_t mode) {
         case DEBUG_WRAM: return "WRAM";
         case DEBUG_READ: return "READ";
         case DEBUG_WRITE: return "WRITE";
+        case DEBUG_WMDATA: return "WMDATA";
         default: return "OFF";
     }
 }
@@ -170,6 +186,7 @@ static void maybe_debug_access(bool is_read, uint32_t address, uint8_t data,
         case DEBUG_WRAM: match = is_wram; break;
         case DEBUG_READ: match = is_read; break;
         case DEBUG_WRITE: match = !is_read; break;
+        case DEBUG_WMDATA: match = false; break;
         default: break;
     }
     if (!match) return;
@@ -218,8 +235,9 @@ static void command_debug(char *args) {
     else if (!strcmp(mode, "WRAM")) new_mode = DEBUG_WRAM;
     else if (!strcmp(mode, "READ")) new_mode = DEBUG_READ;
     else if (!strcmp(mode, "WRITE")) new_mode = DEBUG_WRITE;
+    else if (!strcmp(mode, "WMDATA")) new_mode = DEBUG_WMDATA;
     else {
-        printf("ERR DEBUG expects OFF, ALL, WRAM, READ or WRITE\n");
+        printf("ERR DEBUG expects OFF, ALL, WRAM, READ, WRITE or WMDATA\n");
         return;
     }
 
@@ -233,6 +251,132 @@ static void command_debug(char *args) {
     debug_remaining = count;
     printf("OK DEBUG %s %lu (auto-off after matching lines)\n",
            debug_mode_name(debug_mode), (unsigned long)debug_remaining);
+}
+
+static bool is_wram_port_address(uint32_t address, uint16_t *reg_out) {
+    uint8_t bank = (uint8_t)(address >> 16);
+    uint16_t addr = (uint16_t)address;
+    bool io_bank = (bank <= 0x3f) || (bank >= 0x80 && bank <= 0xbf);
+    if (!io_bank || addr < 0x2180u || addr > 0x2183u) return false;
+    if (reg_out) *reg_out = addr;
+    return true;
+}
+
+static bool wmadd_is_known(void) {
+    return wmadd_known_mask == 0x07u;
+}
+
+static void debug_wm_event(const char *fmt, ...) {
+    if (debug_mode != DEBUG_WMDATA || debug_remaining == 0) return;
+
+    va_list ap;
+    va_start(ap, fmt);
+    vprintf(fmt, ap);
+    va_end(ap);
+    printf("\n");
+    fflush(stdout);
+
+    --debug_remaining;
+    if (debug_remaining == 0) {
+        debug_mode = DEBUG_OFF;
+        printf("DEBUG DONE (auto-off)\n");
+        fflush(stdout);
+    }
+}
+
+static void process_wram_port_write(uint32_t address, uint8_t data) {
+    uint16_t reg;
+    if (!is_wram_port_address(address, &reg)) return;
+
+    uint8_t bank = (uint8_t)(address >> 16);
+    switch (reg) {
+        case 0x2181u: // WMADDL
+            wmadd_shadow = (wmadd_shadow & 0x1ff00u) | (uint32_t)data;
+            wmadd_known_mask |= 0x01u;
+            ++total_wmaddr_reg_writes;
+            debug_wm_event("WMADDL WRITE $%02X:2181 = %02X -> WMADD=%05lX mask=%u/7%s",
+                           bank, data, (unsigned long)wmadd_shadow,
+                           (unsigned)wmadd_known_mask, wmadd_is_known() ? " VALID" : "");
+            break;
+
+        case 0x2182u: // WMADDM
+            wmadd_shadow = (wmadd_shadow & 0x100ffu) | ((uint32_t)data << 8);
+            wmadd_known_mask |= 0x02u;
+            ++total_wmaddr_reg_writes;
+            debug_wm_event("WMADDM WRITE $%02X:2182 = %02X -> WMADD=%05lX mask=%u/7%s",
+                           bank, data, (unsigned long)wmadd_shadow,
+                           (unsigned)wmadd_known_mask, wmadd_is_known() ? " VALID" : "");
+            break;
+
+        case 0x2183u: // WMADDH (only bit 0 participates in the 17-bit WRAM pointer)
+            wmadd_shadow = (wmadd_shadow & 0x0ffffu) | (((uint32_t)data & 1u) << 16);
+            wmadd_known_mask |= 0x04u;
+            ++total_wmaddr_reg_writes;
+            debug_wm_event("WMADDH WRITE $%02X:2183 = %02X -> WMADD=%05lX mask=%u/7%s",
+                           bank, data, (unsigned long)wmadd_shadow,
+                           (unsigned)wmadd_known_mask, wmadd_is_known() ? " VALID" : "");
+            break;
+
+        case 0x2180u: { // WMDATA write, then 17-bit pointer increments
+            ++total_wmdata_writes;
+            if (!wmadd_is_known()) {
+                ++total_wmdata_unknown_pointer;
+                debug_wm_event("WMDATA WRITE $%02X:2180 = %02X -> pointer UNKNOWN (mask=%u/7)",
+                               bank, data, (unsigned)wmadd_known_mask);
+                return;
+            }
+
+            uint32_t off = wmadd_shadow & 0x1ffffu;
+            wram[off] = data;
+            mark_wram_known(off);
+            ++total_wmdata_reconstructed_writes;
+            uint32_t next = (off + 1u) & 0x1ffffu;
+            debug_wm_event("WMDATA WRITE $%02X:2180 = %02X -> WRAM[%05lX], next=%05lX",
+                           bank, data, (unsigned long)off, (unsigned long)next);
+            wmadd_shadow = next;
+            break;
+        }
+    }
+}
+
+static void process_wram_port_read(uint32_t address, uint8_t data) {
+    uint16_t reg;
+    if (!is_wram_port_address(address, &reg) || reg != 0x2180u) return;
+
+    ++total_wmdata_reads;
+    uint8_t bank = (uint8_t)(address >> 16);
+    if (!wmadd_is_known()) {
+        ++total_wmdata_unknown_pointer;
+        debug_wm_event("WMDATA READ  $%02X:2180 = %02X -> pointer UNKNOWN (mask=%u/7)",
+                       bank, data, (unsigned)wmadd_known_mask);
+        return;
+    }
+
+    // Experimental: the read and write capture pipelines are buffered independently,
+    // so their software processing order is not guaranteed to be identical to bus order.
+    // We still expose the candidate and use it to improve the mirror, but DEBUG output
+    // labels it EXPERIMENTAL.  A future unified event stream can remove this caveat.
+    uint32_t off = wmadd_shadow & 0x1ffffu;
+    wram[off] = data;
+    mark_wram_known(off);
+    ++total_wmdata_reconstructed_reads;
+    uint32_t next = (off + 1u) & 0x1ffffu;
+    debug_wm_event("WMDATA READ  $%02X:2180 = %02X -> WRAM[%05lX], next=%05lX [EXPERIMENTAL ORDER]",
+                   bank, data, (unsigned long)off, (unsigned long)next);
+    wmadd_shadow = next;
+}
+
+static void command_wmstate(void) {
+    printf("WMSTATE addr=%05lX mask=%u/7 valid=%s addr_reg_w=%llu data_w=%llu data_r=%llu "
+           "recon_w=%llu recon_r=%llu unknown_ptr=%llu\n",
+           (unsigned long)(wmadd_shadow & 0x1ffffu), (unsigned)wmadd_known_mask,
+           wmadd_is_known() ? "YES" : "NO",
+           (unsigned long long)total_wmaddr_reg_writes,
+           (unsigned long long)total_wmdata_writes,
+           (unsigned long long)total_wmdata_reads,
+           (unsigned long long)total_wmdata_reconstructed_writes,
+           (unsigned long long)total_wmdata_reconstructed_reads,
+           (unsigned long long)total_wmdata_unknown_pointer);
 }
 
 static void command_banks(void) {
@@ -301,16 +445,20 @@ static void print_help(void) {
     printf("  DEBUG ALL [N]           print next N A-bus accesses\n");
     printf("  DEBUG READ [N]          print next N reads\n");
     printf("  DEBUG WRITE [N]         print next N writes\n");
+    printf("  DEBUG WMDATA [N]        print $2180-$2183 WRAM-port activity\n");
     printf("  DEBUG OFF               stop debug output\n");
     printf("  BANKS                   show per-bank read/write counters\n");
+    printf("  WMSTATE                 show $2180-$2183 pointer/counters\n");
     printf("  PING                    reply PONG\n");
-    printf("Mirror source: observed WRAM reads + writes.\n");
+    printf("Mirror source: observed WRAM reads+writes plus reconstructed CPU WMDATA ($2180) traffic.\n");
     printf("DEBUG is diagnostic only: use it in PuTTY with the Python RA bridge closed.\n");
 }
 
 static void print_info(void) {
     printf("INFO batches=%lu bus_writes=%llu wram_writes=%llu direct_w=%llu mirror_w=%llu "
-           "bus_reads=%llu wram_reads=%llu direct_r=%llu mirror_r=%llu known=%lu/%u (%.2f%%)\n",
+           "bus_reads=%llu wram_reads=%llu direct_r=%llu mirror_r=%llu "
+           "wmaddr_w=%llu wmdata_w=%llu wmdata_r=%llu wm_recon_w=%llu wm_recon_r=%llu "
+           "wm_unknown=%llu known=%lu/%u (%.2f%%)\n",
            (unsigned long)completed_batches,
            (unsigned long long)total_bus_writes,
            (unsigned long long)total_wram_writes,
@@ -320,6 +468,12 @@ static void print_info(void) {
            (unsigned long long)total_wram_reads,
            (unsigned long long)total_direct_reads,
            (unsigned long long)total_mirror_reads,
+           (unsigned long long)total_wmaddr_reg_writes,
+           (unsigned long long)total_wmdata_writes,
+           (unsigned long long)total_wmdata_reads,
+           (unsigned long long)total_wmdata_reconstructed_writes,
+           (unsigned long long)total_wmdata_reconstructed_reads,
+           (unsigned long long)total_wmdata_unknown_pointer,
            (unsigned long)known_wram_bytes,
            (unsigned)WRAM_SIZE,
            (double)known_wram_bytes * 100.0 / (double)WRAM_SIZE);
@@ -517,11 +671,15 @@ static void execute_command(char *line) {
         memset(wram, 0, sizeof(wram));
         memset(wram_valid, 0, sizeof(wram_valid));
         known_wram_bytes = 0;
-        printf("OK mirror cleared\n");
+        wmadd_shadow = 0;
+        wmadd_known_mask = 0;
+        printf("OK mirror and WMADD state cleared\n");
     } else if (!strcmp(cmd, "DEBUG")) {
         command_debug(rest);
     } else if (!strcmp(cmd, "BANKS")) {
         command_banks();
+    } else if (!strcmp(cmd, "WMSTATE")) {
+        command_wmstate();
     } else {
         printf("ERR unknown command '%s' (type HELP)\n", cmd);
     }
@@ -566,6 +724,10 @@ static void process_write_batch(void) {
         ++total_bus_writes;
         ++bank_write_counts[bank];
 
+        // CPU-side WRAM data/address ports live at $2180-$2183 in I/O banks.
+        // Handle these even though they are not themselves ordinary WRAM addresses.
+        process_wram_port_write(address, data);
+
         uint32_t wram_offset = 0;
         bool direct = false;
         bool is_wram = map_address_to_wram(address, &wram_offset, &direct);
@@ -591,6 +753,8 @@ static void process_read_batch(void) {
 
         ++total_bus_reads;
         ++bank_read_counts[bank];
+
+        process_wram_port_read(address, data);
 
         uint32_t wram_offset = 0;
         bool direct = false;
@@ -620,14 +784,14 @@ int main(void) {
     memset(wram, 0, sizeof(wram));
     memset(wram_valid, 0, sizeof(wram_valid));
 
-    printf("\n=== SNES RP2350B RA Bridge Firmware v1.1 REMAP+DEBUG ===\n");
-    printf("Passive A-bus read+write monitor; measured address wiring remapped in software.\n");
+    printf("\n=== SNES RP2350B RA Bridge Firmware v1.2 WMDATA ===\n");
+    printf("Passive A-bus monitor with address remap + CPU WMDATA ($2180-$2183) reconstruction.\n");
     printf("PHI2=GP0 /WR=GP1 /RD=GP35 D0-D7=GP2-9; address GPIO order is remapped in firmware.\n");
-    printf("The 128 KiB mirror learns from observed WRAM reads and writes; unseen bytes remain UNKNOWN.\n");
+    printf("The 128 KiB mirror learns from direct/mirror WRAM traffic and CPU-side WMDATA accesses; unseen bytes remain UNKNOWN.\n");
     printf("Keep the RP2350B powered before powering the SNES.\n");
     printf("Measured map: A0=12 A1=11 A2=10 A3=13 A4=14 A5=16 A6=15 A7=17\n");
     printf("              A8=19 A9=21 A10=22 ... A22=34 A23=18 (GP20 skipped)\n");
-    printf("Type HELP for commands; DEBUG WRAM 64 shows live-style bus data.\n\n");
+    printf("Type HELP for commands; DEBUG WRAM 64 or DEBUG WMDATA 64 shows live-style bus data.\n\n");
     fflush(stdout);
 
     for (uint pin = 0; pin <= 35; ++pin) {
@@ -736,8 +900,8 @@ int main(void) {
     channel_config_set_write_increment(&dc_read_hi, true);
     channel_config_set_dreq(&dc_read_hi, pio_get_dreq(pio_hi, sm_read_hi, false));
 
-    printf("READY. Read+write capture runs quietly in the background (v1.1 remap).\n");
-    printf("Use INFO, BANKS, DEBUG, READ, READSNES, HEX, DUMPBIN or RBIN.\n\n");
+    printf("READY. Read+write capture runs quietly in the background (v1.2 WMDATA).\n");
+    printf("Use INFO, BANKS, WMSTATE, DEBUG, READ, READSNES, HEX, DUMPBIN or RBIN.\n\n");
     fflush(stdout);
 
     // Start both capture pipelines. Each pipeline is independently rearmed when its
