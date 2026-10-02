@@ -1,0 +1,18 @@
+.pio_version 1
+.program snes_capture_read_high
+; RP2350 PIO1 SM1, GPIO base = 16
+;
+; GP18     = A8
+; GP19     = A9
+; GP20     = unused/dummy
+; GP21-34  = A10-A23
+;
+; PIO0 signals IRQ1 while PHI2 is high.
+
+.wrap_target
+    wait 1 irq 1           ; event from PIO0; clears PIO1 IRQ1
+    mov isr, null
+    in pins, 17            ; A8,A9,dummy,A10..A23
+    push block
+    nop
+.wrap

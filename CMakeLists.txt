@@ -15,6 +15,9 @@ add_executable(snes_rp2350b_capture main.c)
 
 pico_generate_pio_header(snes_rp2350b_capture ${CMAKE_CURRENT_LIST_DIR}/capture_low.pio)
 pico_generate_pio_header(snes_rp2350b_capture ${CMAKE_CURRENT_LIST_DIR}/capture_high.pio)
+pico_generate_pio_header(snes_rp2350b_capture ${CMAKE_CURRENT_LIST_DIR}/capture_read_trigger.pio)
+pico_generate_pio_header(snes_rp2350b_capture ${CMAKE_CURRENT_LIST_DIR}/capture_read_low.pio)
+pico_generate_pio_header(snes_rp2350b_capture ${CMAKE_CURRENT_LIST_DIR}/capture_read_high.pio)
 
 target_link_libraries(snes_rp2350b_capture
     pico_stdlib

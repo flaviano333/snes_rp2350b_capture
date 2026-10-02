@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-RP2350B -> usb2snes compatibility bridge for RA2Snes.
+RP2350B read+write WRAM -> usb2snes compatibility bridge for RA2Snes.
 
 This program exposes a small subset of the QUsb2Snes WebSocket protocol on
 ws://127.0.0.1:23074 and maps usb2snes WRAM reads (0xF50000+) to the
 RP2350B firmware's passive WRAM mirror.
 
 It also serves a local SNES ROM file so RA2Snes can identify/hash the game.
-First target: RA2Snes Softcore mode.
+Target: RA2Snes Softcore mode. Firmware v1.0 learns WRAM from reads and writes.
 """
 import argparse
 import asyncio
@@ -23,7 +23,7 @@ import websockets
 USB2SNES_WRAM_BASE = 0xF50000
 WRAM_SIZE = 128 * 1024
 USB2SNES_SRAM_BASE = 0xE00000
-DEVICE_NAME = "RP2350B RA Bridge"
+DEVICE_NAME = "RP2350B RA Bridge RW"
 CONFIG_YML = (
     "EnableCheats: false\n"
     "EnableIngameSavestate: 0\n"

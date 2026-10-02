@@ -12,11 +12,15 @@
 #include "hardware/gpio.h"
 #include "capture_low.pio.h"
 #include "capture_high.pio.h"
+#include "capture_read_trigger.pio.h"
+#include "capture_read_low.pio.h"
+#include "capture_read_high.pio.h"
 
 #define PIN_PHI2       0
 #define PIN_WR         1
 #define PIN_DATA_BASE  2
 #define PIN_HIGH_BASE  18
+#define PIN_RD         35
 
 #define SAMPLE_COUNT   256
 #define WRAM_SIZE      (128u * 1024u)
@@ -25,6 +29,8 @@
 
 static uint32_t low_samples[SAMPLE_COUNT];
 static uint32_t high_samples[SAMPLE_COUNT];
+static uint32_t read_low_samples[SAMPLE_COUNT];
+static uint32_t read_high_samples[SAMPLE_COUNT];
 
 // Passive WRAM mirror. A byte is marked valid only after this adapter
 // has actually observed a write to it.
@@ -36,6 +42,10 @@ static uint64_t total_bus_writes = 0;
 static uint64_t total_wram_writes = 0;
 static uint64_t total_direct_writes = 0;
 static uint64_t total_mirror_writes = 0;
+static uint64_t total_bus_reads = 0;
+static uint64_t total_wram_reads = 0;
+static uint64_t total_direct_reads = 0;
+static uint64_t total_mirror_reads = 0;
 static uint32_t completed_batches = 0;
 
 static char cmd_buf[CMD_BUF_SIZE];
@@ -141,15 +151,21 @@ static void print_help(void) {
     printf("  RBIN <off> <len>        raw WRAM range for PC bridge (hex; max 1000 bytes)\n");
     printf("  CLEAR                   clear the software mirror/known bitmap\n");
     printf("  PING                    reply PONG\n");
+    printf("Mirror source: observed WRAM reads + writes.\n");
 }
 
 static void print_info(void) {
-    printf("INFO batches=%lu bus_writes=%llu wram_writes=%llu direct=%llu mirror=%llu known=%lu/%u (%.2f%%)\n",
+    printf("INFO batches=%lu bus_writes=%llu wram_writes=%llu direct_w=%llu mirror_w=%llu "
+           "bus_reads=%llu wram_reads=%llu direct_r=%llu mirror_r=%llu known=%lu/%u (%.2f%%)\n",
            (unsigned long)completed_batches,
            (unsigned long long)total_bus_writes,
            (unsigned long long)total_wram_writes,
            (unsigned long long)total_direct_writes,
            (unsigned long long)total_mirror_writes,
+           (unsigned long long)total_bus_reads,
+           (unsigned long long)total_wram_reads,
+           (unsigned long long)total_direct_reads,
+           (unsigned long long)total_mirror_reads,
            (unsigned long)known_wram_bytes,
            (unsigned)WRAM_SIZE,
            (double)known_wram_bytes * 100.0 / (double)WRAM_SIZE);
@@ -379,7 +395,7 @@ static void poll_serial_commands(void) {
     }
 }
 
-static void process_capture_batch(void) {
+static void process_write_batch(void) {
     ++completed_batches;
 
     for (int i = 0; i < SAMPLE_COUNT; ++i) {
@@ -403,6 +419,30 @@ static void process_capture_batch(void) {
     }
 }
 
+static void process_read_batch(void) {
+    for (int i = 0; i < SAMPLE_COUNT; ++i) {
+        uint16_t low16 = unpack_low16(read_low_samples[i]);
+        uint32_t high17 = unpack_high17(read_high_samples[i]);
+        uint8_t data = (uint8_t)(low16 & 0xffu);
+        uint32_t address = reconstruct_address(low16, high17) & 0xffffffu;
+
+        ++total_bus_reads;
+
+        uint32_t wram_offset;
+        bool direct;
+        if (!map_address_to_wram(address, &wram_offset, &direct)) continue;
+
+        ++total_wram_reads;
+        if (direct) ++total_direct_reads;
+        else ++total_mirror_reads;
+
+        // A read gives us the actual byte currently present in WRAM, so it can
+        // initialise an UNKNOWN byte and repair a stale value if a write was missed.
+        wram[wram_offset] = data;
+        mark_wram_known(wram_offset);
+    }
+}
+
 int main(void) {
     stdio_init_all();
 
@@ -414,16 +454,16 @@ int main(void) {
     memset(wram, 0, sizeof(wram));
     memset(wram_valid, 0, sizeof(wram_valid));
 
-    printf("\n=== SNES RP2350B RA Bridge Firmware v0.9 ===\n");
-    printf("Passive A-bus monitor; no GP35/GP36 jumpers.\n");
-    printf("PHI2=GP0 /WR=GP1 D0-D7=GP2-9 A0-A9=GP10-19 GP20 skipped A10-A23=GP21-34.\n");
-    printf("The 128 KiB mirror is PARTIAL: only observed writes are marked KNOWN.\n");
+    printf("\n=== SNES RP2350B RA Bridge Firmware v1.0 RW ===\n");
+    printf("Passive A-bus read+write monitor; /RD=GP35; no PHI2/WR duplicate jumpers.\n");
+    printf("PHI2=GP0 /WR=GP1 /RD=GP35 D0-D7=GP2-9 A0-A9=GP10-19 GP20 skipped A10-A23=GP21-34.\n");
+    printf("The 128 KiB mirror learns from observed WRAM reads and writes; unseen bytes remain UNKNOWN.\n");
     printf("Keep the RP2350B powered before powering the SNES.\n");
     printf("Type HELP for commands.\n\n");
     fflush(stdout);
 
-    for (uint pin = 0; pin <= 34; ++pin) {
-        configure_input(pin, pin == PIN_WR);
+    for (uint pin = 0; pin <= 35; ++pin) {
+        configure_input(pin, pin == PIN_WR || pin == PIN_RD);
     }
 
     // ---------- PIO0: timing + D0-D7 + A0-A7 ----------
@@ -457,9 +497,39 @@ int main(void) {
     sm_config_set_fifo_join(&c_hi, PIO_FIFO_JOIN_RX);
     int init_hi_rc = pio_sm_init(pio_hi, sm_hi, off_hi, &c_hi);
 
-    printf("PIO init: base_lo=%d init_lo=%d | base_hi=%d init_hi=%d\n",
-           base_lo_rc, init_lo_rc, base_hi_rc, init_hi_rc);
-    if (base_lo_rc || init_lo_rc || base_hi_rc || init_hi_rc) {
+    // ---------- PIO2: /RD detector ----------
+    PIO pio_rd = pio2;
+    const uint sm_rd_trigger = 0;
+    int base_rd_rc = pio_set_gpio_base(pio_rd, 16);
+    pio_gpio_init(pio_rd, PIN_RD);
+    pio_sm_set_consecutive_pindirs(pio_rd, sm_rd_trigger, PIN_RD, 1, false);
+    uint off_rd_trigger = pio_add_program(pio_rd, &snes_read_trigger_program);
+    pio_sm_config c_rd_trigger = snes_read_trigger_program_get_default_config(off_rd_trigger);
+    int init_rd_trigger_rc = pio_sm_init(pio_rd, sm_rd_trigger, off_rd_trigger, &c_rd_trigger);
+
+    // ---------- PIO0 SM1: D0-D7 + A0-A7 on reads ----------
+    const uint sm_read_lo = 1;
+    uint off_read_lo = pio_add_program(pio_lo, &snes_capture_read_low_program);
+    pio_sm_config c_read_lo = snes_capture_read_low_program_get_default_config(off_read_lo);
+    sm_config_set_in_pins(&c_read_lo, PIN_DATA_BASE);
+    sm_config_set_in_shift(&c_read_lo, true, false, 32);
+    sm_config_set_fifo_join(&c_read_lo, PIO_FIFO_JOIN_RX);
+    int init_read_lo_rc = pio_sm_init(pio_lo, sm_read_lo, off_read_lo, &c_read_lo);
+
+    // ---------- PIO1 SM1: A8-A23 on reads ----------
+    const uint sm_read_hi = 1;
+    uint off_read_hi = pio_add_program(pio_hi, &snes_capture_read_high_program);
+    pio_sm_config c_read_hi = snes_capture_read_high_program_get_default_config(off_read_hi);
+    sm_config_set_in_pins(&c_read_hi, PIN_HIGH_BASE);
+    sm_config_set_in_shift(&c_read_hi, true, false, 32);
+    sm_config_set_fifo_join(&c_read_hi, PIO_FIFO_JOIN_RX);
+    int init_read_hi_rc = pio_sm_init(pio_hi, sm_read_hi, off_read_hi, &c_read_hi);
+
+    printf("PIO init: base_lo=%d init_lo=%d | base_hi=%d init_hi=%d | base_rd=%d trig=%d read_lo=%d read_hi=%d\n",
+           base_lo_rc, init_lo_rc, base_hi_rc, init_hi_rc,
+           base_rd_rc, init_rd_trigger_rc, init_read_lo_rc, init_read_hi_rc);
+    if (base_lo_rc || init_lo_rc || base_hi_rc || init_hi_rc ||
+        base_rd_rc || init_rd_trigger_rc || init_read_lo_rc || init_read_hi_rc) {
         printf("ERROR: PIO configuration failed. Leave the SNES off.\n");
         fflush(stdout);
         while (true) {
@@ -483,35 +553,102 @@ int main(void) {
     channel_config_set_write_increment(&dc_hi, true);
     channel_config_set_dreq(&dc_hi, pio_get_dreq(pio_hi, sm_hi, false));
 
-    printf("READY. Capture runs quietly in the background.\n");
+    int dma_read_lo = dma_claim_unused_channel(true);
+    int dma_read_hi = dma_claim_unused_channel(true);
+
+    dma_channel_config dc_read_lo = dma_channel_get_default_config(dma_read_lo);
+    channel_config_set_transfer_data_size(&dc_read_lo, DMA_SIZE_32);
+    channel_config_set_read_increment(&dc_read_lo, false);
+    channel_config_set_write_increment(&dc_read_lo, true);
+    channel_config_set_dreq(&dc_read_lo, pio_get_dreq(pio_lo, sm_read_lo, false));
+
+    dma_channel_config dc_read_hi = dma_channel_get_default_config(dma_read_hi);
+    channel_config_set_transfer_data_size(&dc_read_hi, DMA_SIZE_32);
+    channel_config_set_read_increment(&dc_read_hi, false);
+    channel_config_set_write_increment(&dc_read_hi, true);
+    channel_config_set_dreq(&dc_read_hi, pio_get_dreq(pio_hi, sm_read_hi, false));
+
+    printf("READY. Read+write capture runs quietly in the background.\n");
     printf("Use INFO, READ, READSNES, HEX, DUMPBIN or RBIN.\n\n");
     fflush(stdout);
 
+    // Start both capture pipelines. Each pipeline is independently rearmed when its
+    // low+high DMA pair fills, so read traffic does not have to wait for writes and vice versa.
+
+    // Write pipeline initial arm.
+    pio_sm_set_enabled(pio_lo, sm_lo, false);
+    pio_sm_set_enabled(pio_hi, sm_hi, false);
+    pio_sm_restart(pio_lo, sm_lo);
+    pio_sm_restart(pio_hi, sm_hi);
+    pio_sm_clear_fifos(pio_lo, sm_lo);
+    pio_sm_clear_fifos(pio_hi, sm_hi);
+    pio_interrupt_clear(pio_hi, 0);
+    arm_dma_channel(dma_lo, &dc_lo, low_samples, &pio_lo->rxf[sm_lo]);
+    arm_dma_channel(dma_hi, &dc_hi, high_samples, &pio_hi->rxf[sm_hi]);
+    dma_start_channel_mask((1u << dma_lo) | (1u << dma_hi));
+    pio_sm_set_enabled(pio_hi, sm_hi, true);
+    pio_sm_set_enabled(pio_lo, sm_lo, true);
+
+    // Read pipeline initial arm.
+    pio_sm_set_enabled(pio_rd, sm_rd_trigger, false);
+    pio_sm_set_enabled(pio_lo, sm_read_lo, false);
+    pio_sm_set_enabled(pio_hi, sm_read_hi, false);
+    pio_sm_restart(pio_rd, sm_rd_trigger);
+    pio_sm_restart(pio_lo, sm_read_lo);
+    pio_sm_restart(pio_hi, sm_read_hi);
+    pio_sm_clear_fifos(pio_lo, sm_read_lo);
+    pio_sm_clear_fifos(pio_hi, sm_read_hi);
+    pio_interrupt_clear(pio_lo, 1);
+    pio_interrupt_clear(pio_hi, 1);
+    arm_dma_channel(dma_read_lo, &dc_read_lo, read_low_samples, &pio_lo->rxf[sm_read_lo]);
+    arm_dma_channel(dma_read_hi, &dc_read_hi, read_high_samples, &pio_hi->rxf[sm_read_hi]);
+    dma_start_channel_mask((1u << dma_read_lo) | (1u << dma_read_hi));
+    pio_sm_set_enabled(pio_hi, sm_read_hi, true);
+    pio_sm_set_enabled(pio_lo, sm_read_lo, true);
+    pio_sm_set_enabled(pio_rd, sm_rd_trigger, true);
+
     while (true) {
-        pio_sm_set_enabled(pio_lo, sm_lo, false);
-        pio_sm_set_enabled(pio_hi, sm_hi, false);
-        pio_sm_restart(pio_lo, sm_lo);
-        pio_sm_restart(pio_hi, sm_hi);
-        pio_sm_clear_fifos(pio_lo, sm_lo);
-        pio_sm_clear_fifos(pio_hi, sm_hi);
-        pio_interrupt_clear(pio_hi, 0);
+        poll_serial_commands();
 
-        arm_dma_channel(dma_lo, &dc_lo, low_samples, &pio_lo->rxf[sm_lo]);
-        arm_dma_channel(dma_hi, &dc_hi, high_samples, &pio_hi->rxf[sm_hi]);
-        dma_start_channel_mask((1u << dma_lo) | (1u << dma_hi));
+        if (dma_remaining(dma_lo) == 0 && dma_remaining(dma_hi) == 0) {
+            pio_sm_set_enabled(pio_lo, sm_lo, false);
+            pio_sm_set_enabled(pio_hi, sm_hi, false);
+            process_write_batch();
 
-        pio_sm_set_enabled(pio_hi, sm_hi, true);
-        pio_sm_set_enabled(pio_lo, sm_lo, true);
-
-        while (dma_remaining(dma_lo) != 0 || dma_remaining(dma_hi) != 0) {
-            poll_serial_commands();
-            sleep_us(100);
+            pio_sm_restart(pio_lo, sm_lo);
+            pio_sm_restart(pio_hi, sm_hi);
+            pio_sm_clear_fifos(pio_lo, sm_lo);
+            pio_sm_clear_fifos(pio_hi, sm_hi);
+            pio_interrupt_clear(pio_hi, 0);
+            arm_dma_channel(dma_lo, &dc_lo, low_samples, &pio_lo->rxf[sm_lo]);
+            arm_dma_channel(dma_hi, &dc_hi, high_samples, &pio_hi->rxf[sm_hi]);
+            dma_start_channel_mask((1u << dma_lo) | (1u << dma_hi));
+            pio_sm_set_enabled(pio_hi, sm_hi, true);
+            pio_sm_set_enabled(pio_lo, sm_lo, true);
         }
 
-        pio_sm_set_enabled(pio_lo, sm_lo, false);
-        pio_sm_set_enabled(pio_hi, sm_hi, false);
+        if (dma_remaining(dma_read_lo) == 0 && dma_remaining(dma_read_hi) == 0) {
+            pio_sm_set_enabled(pio_rd, sm_rd_trigger, false);
+            pio_sm_set_enabled(pio_lo, sm_read_lo, false);
+            pio_sm_set_enabled(pio_hi, sm_read_hi, false);
+            process_read_batch();
 
-        process_capture_batch();
-        poll_serial_commands();
+            pio_sm_restart(pio_rd, sm_rd_trigger);
+            pio_sm_restart(pio_lo, sm_read_lo);
+            pio_sm_restart(pio_hi, sm_read_hi);
+            pio_sm_clear_fifos(pio_lo, sm_read_lo);
+            pio_sm_clear_fifos(pio_hi, sm_read_hi);
+            pio_interrupt_clear(pio_lo, 1);
+            pio_interrupt_clear(pio_hi, 1);
+            arm_dma_channel(dma_read_lo, &dc_read_lo, read_low_samples, &pio_lo->rxf[sm_read_lo]);
+            arm_dma_channel(dma_read_hi, &dc_read_hi, read_high_samples, &pio_hi->rxf[sm_read_hi]);
+            dma_start_channel_mask((1u << dma_read_lo) | (1u << dma_read_hi));
+            pio_sm_set_enabled(pio_hi, sm_read_hi, true);
+            pio_sm_set_enabled(pio_lo, sm_read_lo, true);
+            pio_sm_set_enabled(pio_rd, sm_rd_trigger, true);
+        }
+
+        tight_loop_contents();
     }
+
 }
