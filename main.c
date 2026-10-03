@@ -23,7 +23,7 @@
 #define PIN_HIGH_BASE  18
 #define PIN_RD         35
 
-#define SAMPLE_COUNT   256
+#define SAMPLE_COUNT   1024
 #define WRAM_SIZE      (128u * 1024u)
 #define VALID_SIZE     (WRAM_SIZE / 8u)
 #define CMD_BUF_SIZE   4096
@@ -31,10 +31,14 @@
 #define SNAP_MAX_RANGES 256u
 #define SNAP_MAX_BYTES  4096u
 
-static uint32_t low_samples[SAMPLE_COUNT];
-static uint32_t high_samples[SAMPLE_COUNT];
-static uint32_t read_low_samples[SAMPLE_COUNT];
-static uint32_t read_high_samples[SAMPLE_COUNT];
+// v1.6 uses two buffers per capture stream. As soon as one DMA batch fills,
+ // DMA is rearmed into the other buffer BEFORE the completed batch is processed.
+ // This removes the long blind interval present in v1.3.x, where PIO was stopped
+ // while 256 samples were decoded.
+static uint32_t low_samples[2][SAMPLE_COUNT];
+static uint32_t high_samples[2][SAMPLE_COUNT];
+static uint32_t read_low_samples[2][SAMPLE_COUNT];
+static uint32_t read_high_samples[2][SAMPLE_COUNT];
 
 // Passive WRAM mirror. A byte is marked valid after this adapter
 // has observed a WRAM read or write carrying that byte.
@@ -135,12 +139,29 @@ static inline uint32_t sampled_gpio_bit(uint16_t low16, uint32_t high17, uint gp
     return 0;
 }
 
-static uint32_t reconstruct_address(uint16_t low16, uint32_t high17) {
-    uint32_t address = 0;
-    for (uint bit = 0; bit < 24; ++bit) {
-        address |= sampled_gpio_bit(low16, high17, ADDRESS_GPIO[bit]) << bit;
-    }
-    return address;
+static inline uint32_t reconstruct_address(uint16_t low16, uint32_t high17) {
+    // Fast form of the measured wiring permutation.
+    // raw_low bits 0..7 are GP10..GP17:
+    //   A0=r2 A1=r1 A2=r0 A3=r3 A4=r4 A5=r6 A6=r5 A7=r7
+    uint32_t r = (uint32_t)(low16 >> 8);
+    uint32_t low_addr =
+        ((r >> 2) & 1u) << 0 |
+        ((r >> 1) & 1u) << 1 |
+        ((r >> 0) & 1u) << 2 |
+        ((r >> 3) & 1u) << 3 |
+        ((r >> 4) & 1u) << 4 |
+        ((r >> 6) & 1u) << 5 |
+        ((r >> 5) & 1u) << 6 |
+        ((r >> 7) & 1u) << 7;
+
+    // high17 bit0=GP18=A23, bit1=GP19=A8, bit2=GP20 unused,
+    // bits3..16=GP21..GP34=A9..A22.
+    uint32_t high_addr =
+        ((high17 & 0x1u) << 23) |
+        (((high17 >> 1) & 0x1u) << 8) |
+        (((high17 >> 3) & 0x3fffu) << 9);
+
+    return low_addr | high_addr;
 }
 
 static void arm_dma_channel(int channel, const dma_channel_config *cfg,
@@ -816,12 +837,12 @@ static void poll_serial_commands(void) {
     }
 }
 
-static void process_write_batch(void) {
+static void process_write_batch(const uint32_t *low_buf, const uint32_t *high_buf) {
     ++completed_batches;
 
     for (int i = 0; i < SAMPLE_COUNT; ++i) {
-        uint16_t low16 = unpack_low16(low_samples[i]);
-        uint32_t high17 = unpack_high17(high_samples[i]);
+        uint16_t low16 = unpack_low16(low_buf[i]);
+        uint32_t high17 = unpack_high17(high_buf[i]);
         uint8_t data = (uint8_t)(low16 & 0xffu);
         uint32_t address = reconstruct_address(low16, high17) & 0xffffffu;
         uint8_t bank = (uint8_t)(address >> 16);
@@ -848,10 +869,10 @@ static void process_write_batch(void) {
     }
 }
 
-static void process_read_batch(void) {
+static void process_read_batch(const uint32_t *low_buf, const uint32_t *high_buf) {
     for (int i = 0; i < SAMPLE_COUNT; ++i) {
-        uint16_t low16 = unpack_low16(read_low_samples[i]);
-        uint32_t high17 = unpack_high17(read_high_samples[i]);
+        uint16_t low16 = unpack_low16(low_buf[i]);
+        uint32_t high17 = unpack_high17(high_buf[i]);
         uint8_t data = (uint8_t)(low16 & 0xffu);
         uint32_t address = reconstruct_address(low16, high17) & 0xffffffu;
         uint8_t bank = (uint8_t)(address >> 16);
@@ -889,7 +910,7 @@ int main(void) {
     memset(wram, 0, sizeof(wram));
     memset(wram_valid, 0, sizeof(wram_valid));
 
-    printf("\n=== SNES RP2350B RA Bridge Firmware v1.3 ATOMIC SNAPSHOT ===\n");
+    printf("\n=== SNES RP2350B RA Bridge Firmware v1.6 CONTINUOUS DOUBLE BUFFER ===\n");
     printf("Passive A-bus monitor with address remap + atomic multi-range RA snapshots.\n");
     printf("PHI2=GP0 /WR=GP1 /RD=GP35 D0-D7=GP2-9; address GPIO order is remapped in firmware.\n");
     printf("The 128 KiB mirror learns from direct/mirror WRAM traffic and CPU-side WMDATA accesses; unseen bytes remain UNKNOWN.\n");
@@ -1005,7 +1026,7 @@ int main(void) {
     channel_config_set_write_increment(&dc_read_hi, true);
     channel_config_set_dreq(&dc_read_hi, pio_get_dreq(pio_hi, sm_read_hi, false));
 
-    printf("READY. Read+write capture runs quietly in the background (v1.3.1 atomic snapshot, RD trigger fixed).\n");
+    printf("READY. Read+write capture uses v1.6 double buffers with immediate DMA rearm.\n");
     printf("Use INFO, BANKS, WMSTATE, DEBUG, READ, READSNES, HEX, DUMPBIN, RBIN or SNAP.\n\n");
     fflush(stdout);
 
@@ -1020,8 +1041,8 @@ int main(void) {
     pio_sm_clear_fifos(pio_lo, sm_lo);
     pio_sm_clear_fifos(pio_hi, sm_hi);
     pio_interrupt_clear(pio_hi, 0);
-    arm_dma_channel(dma_lo, &dc_lo, low_samples, &pio_lo->rxf[sm_lo]);
-    arm_dma_channel(dma_hi, &dc_hi, high_samples, &pio_hi->rxf[sm_hi]);
+    arm_dma_channel(dma_lo, &dc_lo, low_samples[0], &pio_lo->rxf[sm_lo]);
+    arm_dma_channel(dma_hi, &dc_hi, high_samples[0], &pio_hi->rxf[sm_hi]);
     dma_start_channel_mask((1u << dma_lo) | (1u << dma_hi));
     pio_sm_set_enabled(pio_hi, sm_hi, true);
     pio_sm_set_enabled(pio_lo, sm_lo, true);
@@ -1037,52 +1058,49 @@ int main(void) {
     pio_sm_clear_fifos(pio_hi, sm_read_hi);
     pio_interrupt_clear(pio_lo, 1);
     pio_interrupt_clear(pio_hi, 1);
-    arm_dma_channel(dma_read_lo, &dc_read_lo, read_low_samples, &pio_lo->rxf[sm_read_lo]);
-    arm_dma_channel(dma_read_hi, &dc_read_hi, read_high_samples, &pio_hi->rxf[sm_read_hi]);
+    arm_dma_channel(dma_read_lo, &dc_read_lo, read_low_samples[0], &pio_lo->rxf[sm_read_lo]);
+    arm_dma_channel(dma_read_hi, &dc_read_hi, read_high_samples[0], &pio_hi->rxf[sm_read_hi]);
     dma_start_channel_mask((1u << dma_read_lo) | (1u << dma_read_hi));
     pio_sm_set_enabled(pio_hi, sm_read_hi, true);
     pio_sm_set_enabled(pio_lo, sm_read_lo, true);
     pio_sm_set_enabled(pio_rd, sm_rd_trigger, true);
 
+    uint write_buf = 0;
+    uint read_buf = 0;
+
     while (true) {
-        // Process completed capture batches before servicing serial commands so an
+        // v1.6: when a pair fills, switch DMA to the other buffer immediately.
+        // PIO remains enabled, so its FIFO only has to cover the few register writes
+        // needed to rearm DMA instead of the entire software decoding loop.
         // atomic SNAP sees the freshest software mirror available at that boundary.
         if (dma_remaining(dma_lo) == 0 && dma_remaining(dma_hi) == 0) {
-            pio_sm_set_enabled(pio_lo, sm_lo, false);
-            pio_sm_set_enabled(pio_hi, sm_hi, false);
-            process_write_batch();
+            uint done = write_buf;
+            uint next = done ^ 1u;
 
-            pio_sm_restart(pio_lo, sm_lo);
-            pio_sm_restart(pio_hi, sm_hi);
-            pio_sm_clear_fifos(pio_lo, sm_lo);
-            pio_sm_clear_fifos(pio_hi, sm_hi);
-            pio_interrupt_clear(pio_hi, 0);
-            arm_dma_channel(dma_lo, &dc_lo, low_samples, &pio_lo->rxf[sm_lo]);
-            arm_dma_channel(dma_hi, &dc_hi, high_samples, &pio_hi->rxf[sm_hi]);
+            // Rearm first. Do not stop/restart/clear the PIO state machines.
+            dma_channel_set_write_addr(dma_lo, low_samples[next], false);
+            dma_channel_set_trans_count(dma_lo, SAMPLE_COUNT, false);
+            dma_channel_set_write_addr(dma_hi, high_samples[next], false);
+            dma_channel_set_trans_count(dma_hi, SAMPLE_COUNT, false);
             dma_start_channel_mask((1u << dma_lo) | (1u << dma_hi));
-            pio_sm_set_enabled(pio_hi, sm_hi, true);
-            pio_sm_set_enabled(pio_lo, sm_lo, true);
+            write_buf = next;
+
+            // Decode the completed buffer while hardware fills the alternate one.
+            process_write_batch(low_samples[done], high_samples[done]);
         }
 
         if (dma_remaining(dma_read_lo) == 0 && dma_remaining(dma_read_hi) == 0) {
-            pio_sm_set_enabled(pio_rd, sm_rd_trigger, false);
-            pio_sm_set_enabled(pio_lo, sm_read_lo, false);
-            pio_sm_set_enabled(pio_hi, sm_read_hi, false);
-            process_read_batch();
+            uint done = read_buf;
+            uint next = done ^ 1u;
 
-            pio_sm_restart(pio_rd, sm_rd_trigger);
-            pio_sm_restart(pio_lo, sm_read_lo);
-            pio_sm_restart(pio_hi, sm_read_hi);
-            pio_sm_clear_fifos(pio_lo, sm_read_lo);
-            pio_sm_clear_fifos(pio_hi, sm_read_hi);
-            pio_interrupt_clear(pio_lo, 1);
-            pio_interrupt_clear(pio_hi, 1);
-            arm_dma_channel(dma_read_lo, &dc_read_lo, read_low_samples, &pio_lo->rxf[sm_read_lo]);
-            arm_dma_channel(dma_read_hi, &dc_read_hi, read_high_samples, &pio_hi->rxf[sm_read_hi]);
+            dma_channel_set_write_addr(dma_read_lo, read_low_samples[next], false);
+            dma_channel_set_trans_count(dma_read_lo, SAMPLE_COUNT, false);
+            dma_channel_set_write_addr(dma_read_hi, read_high_samples[next], false);
+            dma_channel_set_trans_count(dma_read_hi, SAMPLE_COUNT, false);
             dma_start_channel_mask((1u << dma_read_lo) | (1u << dma_read_hi));
-            pio_sm_set_enabled(pio_hi, sm_read_hi, true);
-            pio_sm_set_enabled(pio_lo, sm_read_lo, true);
-            pio_sm_set_enabled(pio_rd, sm_rd_trigger, true);
+            read_buf = next;
+
+            process_read_batch(read_low_samples[done], read_high_samples[done]);
         }
 
         poll_serial_commands();

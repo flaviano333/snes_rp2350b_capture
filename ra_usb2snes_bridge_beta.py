@@ -24,8 +24,18 @@ import serial
 import websockets
 
 USB2SNES_WRAM_BASE = 0xF50000
+
 WRAM_SIZE = 128 * 1024
-DEVICE_NAME = "RP2350B RA Bridge v1.3.2"
+
+# Tom & Jerry final-USA RA -> physical BETA/Nightfall WRAM translation.
+# Generated automatically from the two ROM builds.
+from tomjerry_address_map import (
+    EXPLICIT as BETA_WRAM_EXPLICIT,
+    RANGE_RULES as BETA_WRAM_RANGE_RULES,
+    translate_wram_offset,
+)
+
+DEVICE_NAME = "RP2350B RA Bridge v1.6 TomJerry Exact-Map"
 CONFIG_YML = (
     "EnableCheats: false\n"
     "EnableIngameSavestate: 0\n"
@@ -148,7 +158,8 @@ class SerialWRAM:
 
 class BridgeServer:
     def __init__(self, serial_wram: SerialWRAM, rom_path: Path,
-                 verbose=False, trace_ra=False, trace_all=False, trace_snapshots=False):
+                 verbose=False, trace_ra=False, trace_all=False, trace_snapshots=False,
+                 beta_translate=False):
         self.serial_wram = serial_wram
         self.rom_path = rom_path
         self.rom_file = rom_path.read_bytes()
@@ -158,6 +169,7 @@ class BridgeServer:
         self.trace_ra = trace_ra
         self.trace_all = trace_all
         self.trace_snapshots = trace_snapshots
+        self.beta_translate = beta_translate
         self.clients = 0
 
         # Address-set learning and coherent snapshot cache.
@@ -171,6 +183,7 @@ class BridgeServer:
         self._printed_snapshot_activation = False
         self._last_snapshot_summary = None
         self._printed_fully_known = False
+        self._last_unknown_ra = None
 
         # Change-only trace state.
         self._trace_last = {}
@@ -179,6 +192,52 @@ class BridgeServer:
     def log(self, *a):
         if self.verbose:
             print("[bridge]", *a, flush=True)
+
+    def _translate_wram_byte(self, ra_off: int) -> int:
+        if not self.beta_translate:
+            return ra_off
+        return translate_wram_offset(ra_off)
+
+    def _translate_range_bytes(self, off: int, size: int):
+        return [self._translate_wram_byte(off + i) for i in range(size)]
+
+    def _physical_snapshot_ranges(self):
+        phys = set()
+        for off, size in self.ra_ranges.keys():
+            phys.update(self._translate_range_bytes(off, size))
+        if not phys:
+            return []
+
+        ordered = sorted(phys)
+        out = []
+        start = prev = ordered[0]
+        for p in ordered[1:]:
+            if p == prev + 1:
+                prev = p
+                continue
+            out.append((start, prev - start + 1))
+            start = prev = p
+        out.append((start, prev - start + 1))
+        return out
+
+    async def _read_translated_direct(self, off: int, size: int):
+        phys = self._translate_range_bytes(off, size)
+        data_out = bytearray()
+        unknown_total = 0
+        i = 0
+        while i < size:
+            start_phys = phys[i]
+            j = i + 1
+            while j < size and phys[j] == phys[j - 1] + 1:
+                j += 1
+            length = j - i
+            data, unknown = await asyncio.to_thread(
+                self.serial_wram.read_range, start_phys, length
+            )
+            data_out.extend(data)
+            unknown_total += unknown
+            i = j
+        return bytes(data_out), unknown_total
 
     def _register_ra_range(self, off: int, size: int):
         key = (off, size)
@@ -210,7 +269,7 @@ class BridgeServer:
         """Take one firmware-side coherent image of every RA-requested WRAM byte."""
         if not self.saw_ra_getaddress or not self.ra_ranges:
             return
-        ranges = self._merged_ra_ranges()
+        ranges = self._physical_snapshot_ranges() if self.beta_translate else self._merged_ra_ranges()
         total = sum(length for _, length in ranges)
         if len(ranges) > 256 or total > 4096:
             # Do not silently pretend a chunked read is atomic across chunks.
@@ -240,6 +299,23 @@ class BridgeServer:
                 values[off + i] = data[pos]
                 flags[off + i] = bool(known[pos])
                 pos += 1
+
+        # Translate physical unknown flags back to the RA-requested addresses.
+        unknown_ra = []
+        for ra_off, ra_len in self.ra_ranges.keys():
+            for i in range(ra_len):
+                ra_byte = ra_off + i
+                phys = self._translate_wram_byte(ra_byte)
+                if not flags.get(phys, False):
+                    unknown_ra.append(ra_byte)
+        unknown_ra = tuple(sorted(set(unknown_ra)))
+        if unknown_ra != self._last_unknown_ra:
+            if unknown_ra:
+                shown = " ".join(f"+{x:05X}" for x in unknown_ra)
+                print(f"[UNKNOWN-RA] {len(unknown_ra)} byte(s) still unseen by the passive mirror: {shown}", flush=True)
+            else:
+                print("[UNKNOWN-RA] none; every RA-requested byte has been observed at least once.", flush=True)
+            self._last_unknown_ra = unknown_ra
 
         self.snapshot_values = values
         self.snapshot_known = flags
@@ -275,10 +351,11 @@ class BridgeServer:
     def _snapshot_read(self, off: int, size: int):
         if not self.snapshot_active:
             return None
-        if any((off + i) not in self.snapshot_values for i in range(size)):
+        phys = self._translate_range_bytes(off, size)
+        if any(p not in self.snapshot_values for p in phys):
             return None
-        data = bytes(self.snapshot_values[off + i] for i in range(size))
-        known_flags = [self.snapshot_known.get(off + i, False) for i in range(size)]
+        data = bytes(self.snapshot_values[p] for p in phys)
+        known_flags = [self.snapshot_known.get(p, False) for p in phys]
         unknown = sum(1 for k in known_flags if not k)
         return data, unknown, self.snapshot_generation
 
@@ -296,7 +373,17 @@ class BridgeServer:
             else:
                 status = f"PARTIAL {size-unknown}/{size}"
             suffix = f" snap={generation}" if source == "SNAP" and generation is not None else " direct"
-            print(f"[RA-MEM] +{off:05X} len={size:X} data={hexdata} {status}{suffix}", flush=True)
+            if self.beta_translate:
+                phys = self._translate_range_bytes(off, size)
+                if phys == list(range(off, off + size)):
+                    map_text = ""
+                elif len(phys) == 1:
+                    map_text = f" map=+{phys[0]:05X}"
+                else:
+                    map_text = " map=" + ",".join(f"+{p:05X}" for p in phys)
+            else:
+                map_text = ""
+            print(f"[RA-MEM] +{off:05X} len={size:X} data={hexdata} {status}{suffix}{map_text}", flush=True)
         self._trace_last[key] = state
 
     async def read_snes_space(self, address: int, size: int) -> bytes:
@@ -318,7 +405,10 @@ class BridgeServer:
 
             # First discovery cycle or a newly appearing range: fallback only until
             # the next Info boundary creates a complete working-set snapshot.
-            data, unknown = await asyncio.to_thread(self.serial_wram.read_range, off, size)
+            if self.beta_translate:
+                data, unknown = await self._read_translated_direct(off, size)
+            else:
+                data, unknown = await asyncio.to_thread(self.serial_wram.read_range, off, size)
             warn_key = (off, size)
             if self.verbose and unknown and self._unknown_warn_last.get(warn_key) != unknown:
                 print(f"[bridge] WARNING: {unknown}/{size} requested WRAM bytes are not yet known at {off:05X}", flush=True)
@@ -440,7 +530,8 @@ async def amain(args):
             ) from e
 
         bridge = BridgeServer(
-            sw, rom, args.verbose, args.trace_ra, args.trace_all, args.trace_snapshots
+            sw, rom, args.verbose, args.trace_ra, args.trace_all, args.trace_snapshots,
+            args.beta_translate
         )
         md5 = hashlib.md5(bridge.rom_mem).hexdigest()
         print("RP2350B serial: OK (atomic SNAP verified)")
@@ -451,6 +542,17 @@ async def amain(args):
         print("Use SOFTCORE for these tests. Keep the RP powered before the SNES.")
         print("First RA polling cycle learns addresses; coherent atomic snapshots begin on the following Info/GetAddress cycle.")
         print("With corrected A23 on GP18, direct $7E/$7F WRAM can now populate addresses above $1FFF.")
+        if args.beta_translate:
+            print("BETA WRAM TRANSLATION: ENABLED")
+            print("RA2Snes identifies the final USA ROM; final-build WRAM requests are redirected to beta-build equivalents.")
+            print(f"Exact map: {len(BETA_WRAM_EXPLICIT)} explicit WRAM references (no broad range translation)")
+            if BETA_WRAM_RANGE_RULES:
+                for start, end, delta in BETA_WRAM_RANGE_RULES:
+                    sign = "+" if delta >= 0 else ""
+                    print(f"  range +{start:05X}..+{end:05X}: beta = final {sign}{delta}")
+            print("  addresses without explicit evidence remain unchanged")
+        else:
+            print("BETA WRAM TRANSLATION: disabled")
 
         async with websockets.serve(bridge.handler, "127.0.0.1", args.ws_port, max_size=None):
             await asyncio.Future()
@@ -459,7 +561,7 @@ async def amain(args):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="RP2350B SNES -> usb2snes/RA2Snes atomic-snapshot bridge v1.3.2")
+    ap = argparse.ArgumentParser(description="RP2350B SNES -> usb2snes/RA2Snes bridge v1.6 with Tom & Jerry BETA exact map")
     ap.add_argument("--port", required=True, help="RP2350B serial port, e.g. COM7")
     ap.add_argument("--rom", required=True, help="ROM file used ONLY for RA2Snes game identification")
     ap.add_argument("--baud", type=int, default=115200)
@@ -468,6 +570,8 @@ def main():
     ap.add_argument("--trace-ra", action="store_true", help="print RA-requested WRAM values only when data/status changes")
     ap.add_argument("--trace-all", action="store_true", help="with --trace-ra, print every RA WRAM read")
     ap.add_argument("--trace-snapshots", action="store_true", help="print snapshot summary when range/unknown totals change")
+    ap.add_argument("--beta-translate", action="store_true",
+                    help="use the generated final-USA -> BETA Tom & Jerry WRAM auto-map")
     args = ap.parse_args()
     try:
         asyncio.run(amain(args))

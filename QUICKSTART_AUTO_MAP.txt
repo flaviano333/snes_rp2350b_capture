@@ -1,0 +1,9 @@
+1) Extraia o ZIP.
+2) Rode INSTALAR_DEPENDENCIAS.bat uma vez.
+3) Coloque "Tom and Jerry (USA).sfc" na pasta (ou deixe o launcher pedir o caminho).
+4) Feche PuTTY e QUsb2Snes.
+5) RP2350B ligado primeiro; depois SNES com cartucho BETA.
+6) Rode INICIAR_BRIDGE.bat.
+7) Abra RA2Snes em Softcore.
+
+Nao precisa rodar o auto-mapper para jogar e nao precisa catalogar acoes.

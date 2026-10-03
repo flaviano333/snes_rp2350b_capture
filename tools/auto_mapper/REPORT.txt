@@ -1,0 +1,27 @@
+TOM & JERRY FINAL -> BETA STATIC AUTO-MAP
+================================================
+Final: Tom and Jerry (USA).sfc
+  MD5: bc16be2e9c7e170f7cd10da919f3e099
+BETA : BETA Tom & Jerry.SFC
+  MD5: b690ff0d506fc20faf670cd42c3dc01f
+
+Reachable 65C816 instruction starts: 8489
+Exact ROM alignment anchors: 20797
+Most common ROM shifts (BETA offset - final offset):
+    +200 (0xC8) : 12613 anchors
+      +0 (0x0) : 2354 anchors
+    +201 (0xC9) : 1985 anchors
+   +2208 (0x8A0) : 1365 anchors
+   +2816 (0xB00) : 469 anchors
+   +2833 (0xB11) : 380 anchors
+   +2794 (0xAEA) : 325 anchors
+   +2809 (0xAF9) : 171 anchors
+      -7 (0xFFFFFFF9) : 164 anchors
+   +2832 (0xB10) : 156 anchors
+
+Unambiguous changed WRAM addresses: 85
+Inferred range rules:
+  0x00EA6-0x01E69 -> +2  (85 observed source addresses)
+
+The bridge should translate after converting the RA virtual address to a WRAM offset.
+Use translate_wram_offset(offset), or translate_ra_address(address) if the bridge still has the F5xxxx RA address.

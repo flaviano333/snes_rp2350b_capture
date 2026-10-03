@@ -1,0 +1,111 @@
+{
+  "final_rom": {
+    "name": "Tom and Jerry (USA).sfc",
+    "size": 524288,
+    "md5": "bc16be2e9c7e170f7cd10da919f3e099",
+    "title": "Super Tom & Jerry"
+  },
+  "beta_rom": {
+    "name": "BETA Tom & Jerry.SFC",
+    "size": 524288,
+    "md5": "b690ff0d506fc20faf670cd42c3dc01f",
+    "title": "Super Tom & Jerry"
+  },
+  "reachable_instruction_starts": 8489,
+  "anchor_count": 20797,
+  "top_rom_shifts": [
+    {
+      "delta": 200,
+      "anchors": 12613
+    },
+    {
+      "delta": 0,
+      "anchors": 2354
+    },
+    {
+      "delta": 201,
+      "anchors": 1985
+    },
+    {
+      "delta": 2208,
+      "anchors": 1365
+    },
+    {
+      "delta": 2816,
+      "anchors": 469
+    },
+    {
+      "delta": 2833,
+      "anchors": 380
+    },
+    {
+      "delta": 2794,
+      "anchors": 325
+    },
+    {
+      "delta": 2809,
+      "anchors": 171
+    },
+    {
+      "delta": -7,
+      "anchors": 164
+    },
+    {
+      "delta": 2832,
+      "anchors": 156
+    },
+    {
+      "delta": 2841,
+      "anchors": 155
+    },
+    {
+      "delta": 2965,
+      "anchors": 138
+    },
+    {
+      "delta": 2209,
+      "anchors": 131
+    },
+    {
+      "delta": -18,
+      "anchors": 107
+    },
+    {
+      "delta": 78,
+      "anchors": 78
+    },
+    {
+      "delta": 3050,
+      "anchors": 74
+    },
+    {
+      "delta": 2230,
+      "anchors": 32
+    },
+    {
+      "delta": 30,
+      "anchors": 28
+    },
+    {
+      "delta": -8,
+      "anchors": 21
+    },
+    {
+      "delta": -16,
+      "anchors": 21
+    }
+  ],
+  "mapping_rows": 316,
+  "changed_mapping_rows": 85,
+  "explicit_changed_addresses": 85,
+  "ambiguous_changed_sources": [],
+  "rules": [
+    {
+      "start": 3750,
+      "end": 7785,
+      "delta": 2,
+      "supporting_addresses": 85,
+      "confidence": "inferred-static"
+    }
+  ]
+}

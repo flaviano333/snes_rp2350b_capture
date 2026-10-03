@@ -1,0 +1,42 @@
+CORREÇÃO v1.5.1
+================
+
+O log real do RA2Snes revelou uma regressão do auto-mapper v1.5:
+
+    FINAL +010AA estava sendo traduzido para BETA +010AC
+
+Mas o bridge v1.4 já tinha uma correspondência específica validada:
+
+    FINAL +010AA -> BETA +010AA
+
+A causa era a regra automática ampla +2, que estava sobrescrevendo um
+mapeamento específico conhecido.
+
+A v1.5.1 usa esta prioridade:
+
+1. Mapeamentos específicos validados da v1.4
+2. Mapeamentos explícitos encontrados automaticamente
+3. Regra de faixa inferida
+4. Identidade
+
+Mapeamentos importantes para o teste observado:
+
+    +010AA -> +010AA   CORRIGIDO
+    +014FC -> +014FE
+    +0155C -> +0155E
+    +0157A -> +0157C
+    +0287A -> +0287A
+    +02AF2 -> +02AF2
+    +00A06 -> +00A06
+    +00AE8 -> +00AE8
+    +006F4 -> +006F4
+
+Para testar:
+- substitua a pasta v1.5 pela v1.5.1;
+- use o mesmo Tom and Jerry (USA).sfc para identificação;
+- cartucho BETA no SNES;
+- execute INICIAR_BRIDGE.bat;
+- abra RA2Snes em Softcore;
+- reinicie a fase 1 e complete The Marquee novamente.
+
+No log, +010AA NÃO deve mais mostrar "map=+010AC".

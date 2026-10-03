@@ -25,7 +25,7 @@ import websockets
 
 USB2SNES_WRAM_BASE = 0xF50000
 WRAM_SIZE = 128 * 1024
-DEVICE_NAME = "RP2350B RA Bridge v1.3"
+DEVICE_NAME = "RP2350B RA Bridge v1.3.2"
 CONFIG_YML = (
     "EnableCheats: false\n"
     "EnableIngameSavestate: 0\n"
@@ -38,6 +38,8 @@ CONFIG_YML = (
 class SerialWRAM:
     def __init__(self, port: str, baud: int = 115200):
         self.ser = serial.Serial(port, baudrate=baud, timeout=2.0, write_timeout=2.0)
+        self.ser.dtr = True
+        self.ser.rts = True
         self.lock = threading.Lock()
         time.sleep(0.2)
         self.ser.reset_input_buffer()
@@ -168,6 +170,7 @@ class BridgeServer:
         self.snapshot_active = False
         self._printed_snapshot_activation = False
         self._last_snapshot_summary = None
+        self._printed_fully_known = False
 
         # Change-only trace state.
         self._trace_last = {}
@@ -259,6 +262,14 @@ class BridgeServer:
                 f"ranges={len(ranges)} bytes={total} unknown={unknown}",
                 flush=True,
             )
+
+        if unknown == 0 and not self._printed_fully_known:
+            print(
+                f"RA WRAM working set FULLY KNOWN: {len(ranges)} merged ranges / {total} bytes.",
+                flush=True,
+            )
+            self._printed_fully_known = True
+
         self._last_snapshot_summary = summary
 
     def _snapshot_read(self, off: int, size: int):
@@ -432,13 +443,14 @@ async def amain(args):
             sw, rom, args.verbose, args.trace_ra, args.trace_all, args.trace_snapshots
         )
         md5 = hashlib.md5(bridge.rom_mem).hexdigest()
-        print("RP2350B serial: OK (v1.3 SNAP verified)")
+        print("RP2350B serial: OK (atomic SNAP verified)")
         print(f"ROM presented to RA2Snes: {rom.name} ({len(bridge.rom_mem)} bytes cartridge data, MD5 {md5})")
-        print("IMPORTANT: --rom controls RA game identification; the bridge still cannot verify that the physical cartridge is the same ROM/revision.")
+        print("NOTE: --rom controls RA game identification; live achievement memory comes from the physical SNES WRAM mirror.")
         print("usb2snes compatibility server: ws://127.0.0.1:23074")
         print("Do NOT run QUsb2Snes at the same time (same TCP port).")
         print("Use SOFTCORE for these tests. Keep the RP powered before the SNES.")
         print("First RA polling cycle learns addresses; coherent atomic snapshots begin on the following Info/GetAddress cycle.")
+        print("With corrected A23 on GP18, direct $7E/$7F WRAM can now populate addresses above $1FFF.")
 
         async with websockets.serve(bridge.handler, "127.0.0.1", args.ws_port, max_size=None):
             await asyncio.Future()
@@ -447,7 +459,7 @@ async def amain(args):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="RP2350B SNES -> usb2snes/RA2Snes atomic-snapshot bridge")
+    ap = argparse.ArgumentParser(description="RP2350B SNES -> usb2snes/RA2Snes atomic-snapshot bridge v1.3.2")
     ap.add_argument("--port", required=True, help="RP2350B serial port, e.g. COM7")
     ap.add_argument("--rom", required=True, help="ROM file used ONLY for RA2Snes game identification")
     ap.add_argument("--baud", type=int, default=115200)
