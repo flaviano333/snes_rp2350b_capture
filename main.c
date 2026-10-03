@@ -20,8 +20,10 @@
 #define PIN_PHI2       0
 #define PIN_WR         1
 #define PIN_DATA_BASE  2
-#define PIN_HIGH_BASE  18
+#define PIN_HIGH_BASE  21
 #define PIN_RD         35
+#define PIN_ROMSEL     38   // reserved/passive in v1.6O3
+#define PIN_WRAMSEL    39   // optional/reserved for future firmware
 
 #define SAMPLE_COUNT   1024
 #define WRAM_SIZE      (128u * 1024u)
@@ -86,9 +88,9 @@ static uint8_t snap_known[SNAP_MAX_BYTES];
 // Index = logical SNES address bit A0..A23, value = RP2350B GPIO.
 // The PIO programs capture raw GPIO windows; address bits are reordered here.
 static const uint8_t ADDRESS_GPIO[24] = {
-    12, 11, 10, 13, 14, 16, 15, 17,  // A0..A7
-    19, 21, 22, 23, 24, 25, 26, 27,  // A8..A15
-    28, 29, 30, 31, 32, 33, 34, 18   // A16..A23
+    11, 12, 13, 14, 15, 16, 17, 18,  // A0..A7
+    19, 21, 22, 23, 24, 25, 27, 28,  // A8..A15; GP20 + GP26 skipped
+    29, 30, 31, 32, 33, 34, 36, 37   // A16..A23; /RD remains GP35
 };
 
 typedef enum {
@@ -119,47 +121,68 @@ static uint32_t dma_remaining(uint channel) {
     return dma_channel_hw_addr(channel)->transfer_count & 0x0fffffffu;
 }
 
-static uint16_t unpack_low16(uint32_t raw) {
-    return (uint16_t)(raw >> 16);
+static uint32_t unpack_low18(uint32_t raw) {
+    // PIO "in pins, 18" with right-shift leaves captured bits in raw[31:14].
+    return (raw >> 14) & 0x3ffffu;
 }
 
 static uint32_t unpack_high17(uint32_t raw) {
+    // PIO "in pins, 17" with right-shift leaves captured bits in raw[31:15].
     return (raw >> 15) & 0x1ffffu;
 }
 
-static inline uint32_t sampled_gpio_bit(uint16_t low16, uint32_t high17, uint gpio) {
-    // low16 bit 0 is GP2 and bit 15 is GP17.
-    if (gpio >= 10 && gpio <= 17) {
-        return (low16 >> (gpio - 2u)) & 1u;
+static inline uint8_t reconstruct_data(uint32_t low18) {
+    // low18 starts at GP2:
+    // bit0=GP2=D0, bit1=GP3=D1, bit2=GP4=D2
+    // bit3=GP5=dummy
+    // bit4..8=GP6..GP10=D3..D7
+    return (uint8_t)(
+        (low18 & 0x07u) |
+        ((low18 >> 1) & 0xf8u)
+    );
+}
+
+static inline uint32_t sampled_gpio_bit(uint32_t low18, uint32_t high17, uint gpio) {
+    // low18 bit0 is GP2 and bit17 is GP19.
+    if (gpio >= 11 && gpio <= 19) {
+        return (low18 >> (gpio - 2u)) & 1u;
     }
-    // high17 bit 0 is GP18 and bit 16 is GP34.
-    if (gpio >= 18 && gpio <= 34) {
-        return (high17 >> (gpio - 18u)) & 1u;
+    // high17 bit0 is GP21 and bit16 is GP37.
+    if (gpio >= 21 && gpio <= 37) {
+        return (high17 >> (gpio - 21u)) & 1u;
     }
     return 0;
 }
 
-static inline uint32_t reconstruct_address(uint16_t low16, uint32_t high17) {
-    // Fast form of the measured wiring permutation.
-    // raw_low bits 0..7 are GP10..GP17:
-    //   A0=r2 A1=r1 A2=r0 A3=r3 A4=r4 A5=r6 A6=r5 A7=r7
-    uint32_t r = (uint32_t)(low16 >> 8);
-    uint32_t low_addr =
-        ((r >> 2) & 1u) << 0 |
-        ((r >> 1) & 1u) << 1 |
-        ((r >> 0) & 1u) << 2 |
-        ((r >> 3) & 1u) << 3 |
-        ((r >> 4) & 1u) << 4 |
-        ((r >> 6) & 1u) << 5 |
-        ((r >> 5) & 1u) << 6 |
-        ((r >> 7) & 1u) << 7;
+static inline uint32_t reconstruct_address(uint32_t low18, uint32_t high17) {
+    // v1.6O3 ORDERED:
+    //
+    // LOW window GP2..GP19:
+    // GP2..4   = D0..D2
+    // GP5      = dummy (unusable)
+    // GP6..10  = D3..D7
+    // GP11..19 = A0..A8
+    //
+    // HIGH window GP21..GP37:
+    // GP21..25 = A9..A13
+    // GP26     = dummy (unusable)
+    // GP27..34 = A14..A21
+    // GP35     = /RD dummy in sampled high window
+    // GP36..37 = A22..A23
 
-    // high17 bit0=GP18=A23, bit1=GP19=A8, bit2=GP20 unused,
-    // bits3..16=GP21..GP34=A9..A22.
+    uint32_t low_addr = (low18 >> 9) & 0x1ffu;  // A0..A8
+
+    // high17 bits:
+    // 0..4   -> A9..A13
+    // 5      -> GP26 dummy
+    // 6..13  -> A14..A21
+    // 14     -> GP35 /RD dummy
+    // 15..16 -> A22..A23
     uint32_t high_addr =
-        ((high17 & 0x1u) << 23) |
-        (((high17 >> 1) & 0x1u) << 8) |
-        (((high17 >> 3) & 0x3fffu) << 9);
+        ((high17 & 0x1fu) << 9) |
+        (((high17 >> 6) & 0xffu) << 14) |
+        (((high17 >> 15) & 0x1u) << 22) |
+        (((high17 >> 16) & 0x1u) << 23);
 
     return low_addr | high_addr;
 }
@@ -841,10 +864,10 @@ static void process_write_batch(const uint32_t *low_buf, const uint32_t *high_bu
     ++completed_batches;
 
     for (int i = 0; i < SAMPLE_COUNT; ++i) {
-        uint16_t low16 = unpack_low16(low_buf[i]);
+        uint32_t low18 = unpack_low18(low_buf[i]);
         uint32_t high17 = unpack_high17(high_buf[i]);
-        uint8_t data = (uint8_t)(low16 & 0xffu);
-        uint32_t address = reconstruct_address(low16, high17) & 0xffffffu;
+        uint8_t data = reconstruct_data(low18);
+        uint32_t address = reconstruct_address(low18, high17) & 0xffffffu;
         uint8_t bank = (uint8_t)(address >> 16);
 
         ++total_bus_writes;
@@ -871,10 +894,10 @@ static void process_write_batch(const uint32_t *low_buf, const uint32_t *high_bu
 
 static void process_read_batch(const uint32_t *low_buf, const uint32_t *high_buf) {
     for (int i = 0; i < SAMPLE_COUNT; ++i) {
-        uint16_t low16 = unpack_low16(low_buf[i]);
+        uint32_t low18 = unpack_low18(low_buf[i]);
         uint32_t high17 = unpack_high17(high_buf[i]);
-        uint8_t data = (uint8_t)(low16 & 0xffu);
-        uint32_t address = reconstruct_address(low16, high17) & 0xffffffu;
+        uint8_t data = reconstruct_data(low18);
+        uint32_t address = reconstruct_address(low18, high17) & 0xffffffu;
         uint8_t bank = (uint8_t)(address >> 16);
 
         ++total_bus_reads;
@@ -910,27 +933,35 @@ int main(void) {
     memset(wram, 0, sizeof(wram));
     memset(wram_valid, 0, sizeof(wram_valid));
 
-    printf("\n=== SNES RP2350B RA Bridge Firmware v1.6 CONTINUOUS DOUBLE BUFFER ===\n");
-    printf("Passive A-bus monitor with address remap + atomic multi-range RA snapshots.\n");
-    printf("PHI2=GP0 /WR=GP1 /RD=GP35 D0-D7=GP2-9; address GPIO order is remapped in firmware.\n");
-    printf("The 128 KiB mirror learns from direct/mirror WRAM traffic and CPU-side WMDATA accesses; unseen bytes remain UNKNOWN.\n");
-    printf("Keep the RP2350B powered before powering the SNES.\n");
-    printf("Measured map: A0=12 A1=11 A2=10 A3=13 A4=14 A5=16 A6=15 A7=17\n");
-    printf("              A8=19 A9=21 A10=22 ... A22=34 A23=18 (GP20 skipped)\n");
+    printf("\n=== SNES RP2350B RA Firmware v1.6O3 ORDERED / SKIP GP5+GP26 ===\n");
+    printf("Passive A-bus monitor with ordered wiring, GP5+GP26 skipped + atomic RA snapshots.\n");
+    printf("PHI2=GP0 /WR=GP1; D0-D2=GP2-4; GP5=SKIP; D3-D7=GP6-10.
+");
+    printf("ORDERED map: A0..A8=GP11..19; GP20 skipped; A9..A13=GP21..25.
+");
+    printf("             GP26 skipped; A14..A21=GP27..34; /RD=GP35.
+");
+    printf("             A22=GP36 A23=GP37 /ROMSEL=GP38 /WRAMSEL=GP39 optional.
+");
     printf("Type HELP for commands; SNAP is used by the v1.3 RA bridge for coherent reads.\n\n");
     fflush(stdout);
 
-    for (uint pin = 0; pin <= 35; ++pin) {
-        configure_input(pin, pin == PIN_WR || pin == PIN_RD);
+    for (uint pin = 0; pin <= 39; ++pin) {
+        configure_input(
+            pin,
+            pin == PIN_WR || pin == PIN_RD ||
+            pin == PIN_ROMSEL || pin == PIN_WRAMSEL
+        );
     }
 
-    // ---------- PIO0: timing + D0-D7 + A0-A7 ----------
+    // ---------- PIO0: timing + low GPIO window GP2..GP19 ----------
+    // GP5 is an intentional dummy. Data and A0..A8 are reconstructed in C.
     PIO pio_lo = pio0;
     const uint sm_lo = 0;
     int base_lo_rc = pio_set_gpio_base(pio_lo, 0);
 
-    for (uint pin = 0; pin <= 17; ++pin) pio_gpio_init(pio_lo, pin);
-    pio_sm_set_consecutive_pindirs(pio_lo, sm_lo, 0, 18, false);
+    for (uint pin = 0; pin <= 19; ++pin) pio_gpio_init(pio_lo, pin);
+    pio_sm_set_consecutive_pindirs(pio_lo, sm_lo, 0, 20, false);
 
     uint off_lo = pio_add_program(pio_lo, &snes_capture_low_program);
     pio_sm_config c_lo = snes_capture_low_program_get_default_config(off_lo);
@@ -940,13 +971,14 @@ int main(void) {
     sm_config_set_fifo_join(&c_lo, PIO_FIFO_JOIN_RX);
     int init_lo_rc = pio_sm_init(pio_lo, sm_lo, off_lo, &c_lo);
 
-    // ---------- PIO1: A8-A23 ----------
+    // ---------- PIO1: high GPIO window GP21..GP37 ----------
+    // GP26 is ignored; GP35 is /RD; GP36..37 carry A22..A23.
     PIO pio_hi = pio1;
     const uint sm_hi = 0;
     int base_hi_rc = pio_set_gpio_base(pio_hi, 16);
 
-    for (uint pin = 18; pin <= 34; ++pin) pio_gpio_init(pio_hi, pin);
-    pio_sm_set_consecutive_pindirs(pio_hi, sm_hi, 18, 17, false);
+    for (uint pin = 21; pin <= 37; ++pin) pio_gpio_init(pio_hi, pin);
+    pio_sm_set_consecutive_pindirs(pio_hi, sm_hi, 21, 17, false);
 
     uint off_hi = pio_add_program(pio_hi, &snes_capture_high_program);
     pio_sm_config c_hi = snes_capture_high_program_get_default_config(off_hi);
@@ -965,7 +997,7 @@ int main(void) {
     pio_sm_config c_rd_trigger = snes_read_trigger_program_get_default_config(off_rd_trigger);
     int init_rd_trigger_rc = pio_sm_init(pio_rd, sm_rd_trigger, off_rd_trigger, &c_rd_trigger);
 
-    // ---------- PIO0 SM1: D0-D7 + A0-A7 on reads ----------
+    // ---------- PIO0 SM1: GP2..GP19 low window on reads ----------
     const uint sm_read_lo = 1;
     uint off_read_lo = pio_add_program(pio_lo, &snes_capture_read_low_program);
     pio_sm_config c_read_lo = snes_capture_read_low_program_get_default_config(off_read_lo);
@@ -974,7 +1006,7 @@ int main(void) {
     sm_config_set_fifo_join(&c_read_lo, PIO_FIFO_JOIN_RX);
     int init_read_lo_rc = pio_sm_init(pio_lo, sm_read_lo, off_read_lo, &c_read_lo);
 
-    // ---------- PIO1 SM1: A8-A23 on reads ----------
+    // ---------- PIO1 SM1: GP21..GP37 high window on reads ----------
     const uint sm_read_hi = 1;
     uint off_read_hi = pio_add_program(pio_hi, &snes_capture_read_high_program);
     pio_sm_config c_read_hi = snes_capture_read_high_program_get_default_config(off_read_hi);

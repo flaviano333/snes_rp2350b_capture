@@ -3,20 +3,22 @@
 ; RP2350 PIO0 SM1, GPIO base = 0
 ;
 ; GP0      = PHI2
-; GP2-9    = D0-D7
-; GP10-17  = raw address wires; firmware remaps them to A0-A7
+; GP2-4    = D0-D2
+; GP5      = dummy (unusable)
+; GP6-10   = D3-D7
+; GP11-19  = A0-A8
 ;
 ; PIO2 signals IRQ1 in PIO0 when /RD is asserted.
-; We then synchronise to PHI2, ask PIO1 to snapshot A8-A23,
-; and sample data at PHI2 falling edge.
-
+; in_base = GP2. IN PINS,18 reads GP2..GP19.
+; C code removes the GP5 hole and reconstructs D0-D7 + A0-A8.
+;
 .wrap_target
     wait 1 irq 1           ; read-cycle event from PIO2; clears PIO0 IRQ1
     wait 1 gpio 0          ; address stable during PHI2 high
     irq next 1             ; set IRQ1 in PIO1: snapshot A8-A23
     wait 0 gpio 0          ; read data valid at PHI2 falling edge
     mov isr, null
-    in pins, 16            ; D0-D7 + A0-A7
+    in pins, 18            ; D0-D7 + A0-A7
     push block
     nop
 .wrap

@@ -2,15 +2,15 @@
 .program snes_capture_read_high
 ; RP2350 PIO1 SM1, GPIO base = 16
 ;
-; Measured prototype wiring:
-; GP18     = A23
-; GP19     = A8
-; GP20     = unused/dummy
-; GP21-34  = A9-A22
-; C code remaps these raw GPIO bits back to logical A8-A23.
+; GP21-25  = A9-A13
+; GP26     = dummy (unusable)
+; GP27-34  = A14-A21
+; GP35     = /RD dummy in this sampled window
+; GP36-37  = A22-A23
 ;
-; PIO0 signals IRQ1 while PHI2 is high.
-
+; in_base = GP21. IN PINS,17 reads GP21..GP37.
+; C code ignores GP26 and GP35.
+;
 .wrap_target
     wait 1 irq 1           ; event from PIO0; clears PIO1 IRQ1
     mov isr, null

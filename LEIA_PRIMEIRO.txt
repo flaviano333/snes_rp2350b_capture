@@ -1,134 +1,32 @@
-TOM & JERRY BETA + RETROACHIEVEMENTS
-BRIDGE COMPLETO v1.5 AUTO-MAP
-====================================
+SNES RP2350B RA UNIVERSAL v1.6O3
+GP5 + GP26 IGNORADOS
+=================================
 
-Este ZIP recupera o bridge que estava sendo usado e acrescenta o novo
-mapeamento automatico FINAL USA -> BETA/Nightfall.
+Esta revisao foi feita para a sua placa RP2350B com:
+- GP5 inutilizado;
+- GP26 inutilizado;
+- GP20 mantido livre por causa do RGB onboard.
 
-NAO E PRECISO catalogar manualmente cada acao do jogo.
+A estrategia de captura permanece baseada na v1.6 continuous double-buffer.
 
-O QUE ESTA INCLUIDO
--------------------
-- ra_usb2snes_bridge_beta.py
-  Bridge principal. Apresenta a ROM final ao RA2Snes e le a WRAM do SNES real.
+NOVO MAPA:
+GP0       PHI2
+GP1       /WR
+GP2-4     D0-D2
+GP5       PULAR
+GP6-10    D3-D7
+GP11-19   A0-A8
+GP20      PULAR
+GP21-25   A9-A13
+GP26      PULAR
+GP27-34   A14-A21
+GP35      /RD
+GP36      A22
+GP37      A23
+GP38      /ROMSEL
+GP39      /WRAMSEL opcional/reservado
 
-- tomjerry_address_map.py
-  Mapa automatico FINAL -> BETA.
+Consulte PINOUT_ORDENADO_SKIP_GP5_GP26.txt antes de soldar.
 
-- ra_usb2snes_bridge_beta_original_v1.4.py
-  Backup da versao recuperada antes de aplicar o auto-map novo.
-
-- main.c / *.pio / CMakeLists.txt / boards / .github
-  Fontes do firmware RP2350B v1.3.1/RA-ready que o bridge usa.
-
-- wram_client.py
-  Cliente de diagnostico da WRAM.
-
-- tools/auto_mapper/
-  Script e relatorios usados para gerar o mapa das duas ROMs.
-
-- requirements.txt
-  pyserial + websockets.
-
-IMPORTANTE
-----------
-As ROMs do jogo NAO estao incluidas no ZIP.
-
-O cartucho BETA fica fisicamente no SNES.
-A ROM "Tom and Jerry (USA).sfc" no PC serve APENAS para o RA2Snes reconhecer
-o jogo/conjunto correto.
-
-Hash esperado da ROM USA final (sem cabecalho de 512 bytes):
-  bc16be2e9c7e170f7cd10da919f3e099
-
-PASSO A PASSO
--------------
-1. Extraia este ZIP.
-
-2. Se o RP2350B ainda esta com o firmware corrigido que ja usamos, NAO precisa
-   reflashear. A montagem corrigida era:
-
-      A23     -> GP18
-      /RD     -> GP35
-      /ROMSEL -> GP36
-
-3. Rode uma vez:
-
-      INSTALAR_DEPENDENCIAS.bat
-
-   ou:
-
-      python -m pip install -r requirements.txt
-
-4. O jeito mais simples e copiar sua ROM final USA para esta pasta com o nome:
-
-      Tom and Jerry (USA).sfc
-
-   Nao coloque a BETA como ROM de identificacao do bridge.
-
-5. Feche:
-   - PuTTY
-   - QUsb2Snes
-   - qualquer programa usando COM7
-   - qualquer programa usando a porta TCP 23074
-
-6. Ligue primeiro o RP2350B e depois o SNES com o cartucho BETA.
-
-7. Execute:
-
-      INICIAR_BRIDGE.bat
-
-   Por padrao ele usa COM7.
-
-   Se a ROM final nao estiver na pasta, o launcher pede o caminho.
-
-8. Abra RA2Snes em SOFTCORE e conecte ao dispositivo:
-
-      RP2350B RA Bridge v1.5 TomJerry Auto-Map
-
-9. Jogue normalmente.
-
-COMANDO MANUAL
---------------
-Se preferir PowerShell/Prompt:
-
-python .\ra_usb2snes_bridge_beta.py --port COM7 --rom "C:\caminho\Tom and Jerry (USA).sfc" --beta-translate --trace-ra --trace-snapshots
-
-VERIFICAR O PACOTE
-------------------
-Com a ROM final na mesma pasta:
-
-python .\check_setup.py
-
-Ou passe o caminho:
-
-python .\check_setup.py "C:\caminho\Tom and Jerry (USA).sfc"
-
-MAPA ATUAL
-----------
-A analise estatica encontrou 85 referencias de WRAM alteradas e uma regra
-consistente nesta regiao:
-
-  FINAL +00EA6 .. +01E69
-  BETA  = FINAL + 2
-
-Exemplo:
-
-  F51564 -> F51566
-
-Fora das regioes mapeadas, o endereco permanece igual. Exemplos:
-
-  F5287A -> F5287A
-  F52AF2 -> F52AF2
-
-O auto-map e uma inferencia estatica das duas builds. O bridge mantem o trace
-habilitado para podermos identificar qualquer caso ambiguo que apareca durante
-o uso real.
-
-AUTO-MAPPER
------------
-Voce NAO precisa roda-lo para jogar.
-
-Ele esta em tools\auto_mapper apenas para regenerar/analisar o mapa no futuro.
-Para isso seriam necessarias as duas ROMs separadamente; elas nao sao incluidas
-neste pacote.
+Esta continua sendo a firmware UNIVERSAL 1:1:
+sem traducao especifica de Tom & Jerry e sem shim de conquistas.

@@ -25,7 +25,7 @@ import websockets
 
 USB2SNES_WRAM_BASE = 0xF50000
 WRAM_SIZE = 128 * 1024
-DEVICE_NAME = "RP2350B RA Bridge v1.3.2"
+DEVICE_NAME = "RP2350B SNES Universal RA Bridge v1.6O3"
 CONFIG_YML = (
     "EnableCheats: false\n"
     "EnableIngameSavestate: 0\n"
@@ -459,7 +459,7 @@ async def amain(args):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="RP2350B SNES -> usb2snes/RA2Snes atomic-snapshot bridge v1.3.2")
+    ap = argparse.ArgumentParser(description="RP2350B SNES -> usb2snes/RA2Snes universal atomic-snapshot bridge v1.6O3")
     ap.add_argument("--port", required=True, help="RP2350B serial port, e.g. COM7")
     ap.add_argument("--rom", required=True, help="ROM file used ONLY for RA2Snes game identification")
     ap.add_argument("--baud", type=int, default=115200)
