@@ -1,0 +1,60 @@
+TOM & JERRY BETA + RETROACHIEVEMENTS — v1.6
+
+O que mudou
+===========
+
+1) O mapa de WRAM agora é EXACT-ONLY.
+   A regra genérica '+2 em toda a faixa' foi removida.
+   Só endereços com correspondência explícita são traduzidos.
+
+2) O firmware foi alterado para DOUBLE BUFFER.
+   Na versão anterior, quando 256 amostras enchiam o DMA, o firmware:
+      - parava os PIOs;
+      - processava todas as amostras;
+      - limpava/reiniciava;
+      - só então rearmava o DMA.
+   Durante esse intervalo, acessos curtos à WRAM podiam não entrar no espelho.
+
+   Na v1.6, são 2 buffers de 1024 amostras.
+   Quando um enche, o DMA é imediatamente apontado para o outro buffer,
+   sem desligar ou limpar os PIOs. O buffer concluído é processado enquanto
+   o hardware captura o próximo.
+
+3) O bridge agora imprime os endereços do conjunto RA que continuam UNKNOWN:
+      [UNKNOWN-RA] 3 byte(s) ... +00026 +001C1 +01574
+   Não teste a conquista enquanto bytes importantes continuam UNKNOWN.
+
+IMPORTANTE: esta alteração mexe no firmware do RP2350B
+======================================================
+
+O ZIP contém o FONTE e o workflow GitHub Actions, não um UF2 pré-compilado.
+Suba a pasta para o GitHub e execute o workflow "Build UF2".
+O artifact será:
+    snes-rp2350b-ra-bridge-v1.6-continuous-capture-uf2
+
+Depois:
+  1. grave o novo UF2 no RP2350B;
+  2. RP2350B ligado antes do SNES;
+  3. ligue/reset o SNES;
+  4. INICIAR_BRIDGE.bat;
+  5. RA2Snes Softcore;
+  6. observe [UNKNOWN-RA].
+
+O bridge ainda apresenta a ROM final USA:
+  MD5 bc16be2e9c7e170f7cd10da919f3e099
+
+O cartucho físico continua sendo a BETA.
+
+Teste recomendado
+=================
+Depois do RA2Snes conectar, pressione RESET no SNES uma vez.
+Espere alguns segundos.
+
+O ideal é aparecer:
+    [UNKNOWN-RA] none; every RA-requested byte has been observed at least once.
+    RA WRAM working set FULLY KNOWN
+
+Só então jogue The Marquee.
+
+Se algum endereço continuar UNKNOWN mesmo após reset, envie as linhas
+[UNKNOWN-RA] e [RA-MEM]. Isso identifica exatamente o próximo gargalo.

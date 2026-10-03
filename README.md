@@ -1,3 +1,25 @@
+# Tom & Jerry BETA auto-map v1.5
+
+For the current Tom & Jerry BETA/RetroAchievements setup, start with **LEIA_PRIMEIRO.txt** or run **INICIAR_BRIDGE.bat**. The remainder of this README documents the recovered v1.3.1/RA-ready firmware and bridge base.
+
+---
+
+# RA-ready v1.3.2 bridge package
+
+This package keeps the **v1.3.1 fixed firmware** and updates the PC-side
+usb2snes bridge for the corrected A23 setup. No firmware reflash is needed if
+v1.3.1 fixed is already running.
+
+The PC bridge now:
+- explicitly enables DTR/RTS on the serial port;
+- reports when the full RA-requested WRAM working set has become KNOWN;
+- keeps atomic multi-range SNAP behavior;
+- traces RA-requested values with `--trace-ra`.
+
+See `RA_TEST_QUICKSTART.md` or run `start_ra_test.ps1`.
+
+---
+
 # SNES RP2350B RA Bridge v1.3.1 — Atomic Snapshot + /RD trigger fix
 
 This is the v1.3 Atomic Snapshot bridge restored for the corrected hardware:
