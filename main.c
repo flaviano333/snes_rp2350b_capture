@@ -22,8 +22,8 @@
 #define PIN_DATA_BASE  2
 #define PIN_HIGH_BASE  21
 #define PIN_RD         35
-#define PIN_ROMSEL     38   // reserved/passive in v1.6O3
-#define PIN_WRAMSEL    39   // optional/reserved for future firmware
+#define PIN_ROMSEL     38   // active-low ROM select; diagnostic in v2.2 AUTO-ROM
+#define PIN_WRAMSEL    39   // active-low WRAM select, used by v1.8+
 
 #define SAMPLE_COUNT   1024
 #define WRAM_SIZE      (128u * 1024u)
@@ -32,6 +32,8 @@
 #define DEBUG_MAX_LINES 4096u
 #define SNAP_MAX_RANGES 256u
 #define SNAP_MAX_BYTES  4096u
+#define ROMFP_MAX_RECORDS 1024u
+
 
 // v1.6 uses two buffers per capture stream. As soon as one DMA batch fills,
  // DMA is rearmed into the other buffer BEFORE the completed batch is processed.
@@ -42,8 +44,10 @@ static uint32_t high_samples[2][SAMPLE_COUNT];
 static uint32_t read_low_samples[2][SAMPLE_COUNT];
 static uint32_t read_high_samples[2][SAMPLE_COUNT];
 
-// Passive WRAM mirror. A byte is marked valid after this adapter
-// has observed a WRAM read or write carrying that byte.
+// Passive WRAM mirror. In v2.0, writes remain authoritative and are
+// qualified by /WRAMSEL. Qualified A-bus reads can also refresh KNOWN bytes.
+// This READ-REPAIR path fixes stale counters when an occasional write sample
+// is missed: a later physical WRAM read restores the mirror to the bus value.
 static uint8_t wram[WRAM_SIZE];
 static uint8_t wram_valid[VALID_SIZE];
 static uint32_t known_wram_bytes = 0;
@@ -56,6 +60,12 @@ static uint64_t total_bus_reads = 0;
 static uint64_t total_wram_reads = 0;
 static uint64_t total_direct_reads = 0;
 static uint64_t total_mirror_reads = 0;
+static uint64_t total_wramsel_write_ok = 0;
+static uint64_t total_wramsel_write_reject = 0;
+static uint64_t total_wramsel_read_seed = 0;
+static uint64_t total_wramsel_read_same = 0;
+static uint64_t total_wramsel_read_repair = 0;
+static uint64_t total_wramsel_read_ignored = 0;
 static uint64_t total_wmaddr_reg_writes = 0;
 static uint64_t total_wmdata_writes = 0;
 static uint64_t total_wmdata_reads = 0;
@@ -67,6 +77,32 @@ static uint64_t total_snapshots = 0;
 static uint32_t last_snapshot_ranges = 0;
 static uint32_t last_snapshot_bytes = 0;
 static uint32_t last_snapshot_unknown = 0;
+
+// v2.2 AUTO-ROM fingerprint.
+// The v2.1 detector trusted /ROMSEL at the exact high-window sample instant. On real
+// hardware that proved too timing-sensitive: a valid cartridge could yield essentially
+// random ROM matches. v2.2 therefore fingerprints only a conservative A-bus window that
+// is ROM for both LoROM and HiROM: banks $00-$3F/$80-$BF at $8000-$FFFF.
+// GP38=/ROMSEL is still sampled and counted as a diagnostic, but it is no longer required
+// for a sample to enter the fingerprint. This does NOT touch the proven v2.0 WRAM path.
+static uint32_t romfp_addr[ROMFP_MAX_RECORDS];
+static uint8_t romfp_data[ROMFP_MAX_RECORDS];
+static uint32_t romfp_count = 0;
+static uint64_t total_romsel_reads = 0;
+static uint64_t total_rom_window_reads = 0;
+static uint64_t total_rom_window_romsel_low = 0;
+static uint32_t romfp_last_addr = 0xffffffffu;
+static uint8_t romfp_last_data = 0u;
+
+
+// Tom and Jerry (USA) targeted diagnostic. Known Action Replay codes for
+// 99 cheese bits write 0x63 to WRAM $7E:1558 and $7E:155C. These counters
+// let the PC bridge prove whether the physical bus mirror is actually moving.
+#define CHEESE_OFF_A 0x1558u
+#define CHEESE_OFF_B 0x155Cu
+static uint64_t cheese_write_seen[2] = {0, 0};
+static uint64_t cheese_read_seen[2] = {0, 0};
+static uint64_t cheese_repair_seen[2] = {0, 0};
 
 // CPU-side WRAM port ($2180-$2183) shadow.  The three WMADD registers form
 // a 17-bit pointer.  This is useful when a game accesses WRAM above $1FFF
@@ -89,8 +125,8 @@ static uint8_t snap_known[SNAP_MAX_BYTES];
 // The PIO programs capture raw GPIO windows; address bits are reordered here.
 static const uint8_t ADDRESS_GPIO[24] = {
     11, 12, 13, 14, 15, 16, 17, 18,  // A0..A7
-    19, 21, 22, 23, 24, 25, 27, 28,  // A8..A15; GP20 + GP26 skipped
-    29, 30, 31, 32, 33, 34, 36, 37   // A16..A23; /RD remains GP35
+    19, 21, 40, 23, 24, 25, 27, 28,  // A8..A15; A10 moved to GP40
+    29, 30, 31, 32, 33, 34, 36, 37   // A16..A23
 };
 
 typedef enum {
@@ -109,6 +145,10 @@ static uint64_t bank_read_counts[256];
 
 static void strtoupper_inplace(char *s);
 static void mark_wram_known(uint32_t offset);
+static bool wram_byte_known(uint32_t offset);
+static bool seed_wram_if_unknown(uint32_t offset, uint8_t data);
+static int refresh_wram_from_read(uint32_t offset, uint8_t data);
+static int cheese_slot(uint32_t offset);
 
 static void configure_input(uint pin, bool pull_up) {
     gpio_init(pin);
@@ -126,15 +166,15 @@ static uint32_t unpack_low18(uint32_t raw) {
     return (raw >> 14) & 0x3ffffu;
 }
 
-static uint32_t unpack_high17(uint32_t raw) {
-    // PIO "in pins, 17" with right-shift leaves captured bits in raw[31:15].
-    return (raw >> 15) & 0x1ffffu;
+static uint32_t unpack_high20(uint32_t raw) {
+    // PIO "in pins, 20" with right-shift leaves captured bits in raw[31:12].
+    return (raw >> 12) & 0xfffffu;
 }
 
 static inline uint8_t reconstruct_data(uint32_t low18) {
     // low18 starts at GP2:
     // bit0=GP2=D0, bit1=GP3=D1, bit2=GP4=D2
-    // bit3=GP5=dummy
+    // bit3=GP5=dummy/unusable
     // bit4..8=GP6..GP10=D3..D7
     return (uint8_t)(
         (low18 & 0x07u) |
@@ -142,20 +182,65 @@ static inline uint8_t reconstruct_data(uint32_t low18) {
     );
 }
 
-static inline uint32_t sampled_gpio_bit(uint32_t low18, uint32_t high17, uint gpio) {
+static inline bool sampled_wramsel_active(uint32_t high20) {
+    // HIGH window starts at GP21, therefore GP39 is bit 18.
+    // /WRAMSEL is active low on the SNES bus.
+    return ((high20 >> (PIN_WRAMSEL - PIN_HIGH_BASE)) & 1u) == 0u;
+}
+
+static inline bool sampled_romsel_active(uint32_t high20) {
+    // HIGH window starts at GP21, therefore GP38 is bit 17.
+    // /ROMSEL (/CART) is active low on cartridge-ROM accesses.
+    return ((high20 >> (PIN_ROMSEL - PIN_HIGH_BASE)) & 1u) == 0u;
+}
+
+static inline bool is_safe_rom_fingerprint_window(uint32_t address) {
+    uint8_t bank = (uint8_t)(address >> 16);
+    uint16_t addr = (uint16_t)address;
+    bool low_or_mirror_bank = (bank <= 0x3fu) || (bank >= 0x80u && bank <= 0xbfu);
+    return low_or_mirror_bank && addr >= 0x8000u;
+}
+
+static inline void record_rom_fingerprint(uint32_t address, uint8_t data, uint32_t high20) {
+    bool romsel = sampled_romsel_active(high20);
+    if (romsel) ++total_romsel_reads;
+
+    // v2.2 SAFE-WINDOW: do not depend on the exact /ROMSEL sampling instant.
+    // $00-$3F/$80-$BF:$8000-$FFFF is cartridge ROM space for both conventional
+    // LoROM and HiROM mappings, so these reads are suitable for mapper scoring.
+    if (!is_safe_rom_fingerprint_window(address)) return;
+    ++total_rom_window_reads;
+    if (romsel) ++total_rom_window_romsel_low;
+
+    // Keep the first diverse address/data stream. Consecutive identical reads add no
+    // identification information and are skipped. Once full, the table stays stable
+    // so a later ROMFP query cannot mix two different moments during one comparison.
+    if (romfp_count >= ROMFP_MAX_RECORDS) return;
+    if (address == romfp_last_addr && data == romfp_last_data) return;
+
+    romfp_addr[romfp_count] = address & 0x00ffffffu;
+    romfp_data[romfp_count] = data;
+    ++romfp_count;
+    romfp_last_addr = address & 0x00ffffffu;
+    romfp_last_data = data;
+}
+
+static inline uint32_t sampled_gpio_bit(uint32_t low18, uint32_t high20, uint gpio) {
     // low18 bit0 is GP2 and bit17 is GP19.
     if (gpio >= 11 && gpio <= 19) {
         return (low18 >> (gpio - 2u)) & 1u;
     }
-    // high17 bit0 is GP21 and bit16 is GP37.
-    if (gpio >= 21 && gpio <= 37) {
-        return (high17 >> (gpio - 21u)) & 1u;
+
+    // high20 bit0 is GP21 and bit19 is GP40.
+    if (gpio >= 21 && gpio <= 40) {
+        return (high20 >> (gpio - 21u)) & 1u;
     }
+
     return 0;
 }
 
-static inline uint32_t reconstruct_address(uint32_t low18, uint32_t high17) {
-    // v1.6O3 ORDERED:
+static inline uint32_t reconstruct_address(uint32_t low18, uint32_t high20) {
+    // v1.6O3d ORDERED:
     //
     // LOW window GP2..GP19:
     // GP2..4   = D0..D2
@@ -163,26 +248,42 @@ static inline uint32_t reconstruct_address(uint32_t low18, uint32_t high17) {
     // GP6..10  = D3..D7
     // GP11..19 = A0..A8
     //
-    // HIGH window GP21..GP37:
-    // GP21..25 = A9..A13
+    // HIGH window GP21..GP40:
+    // GP21     = A9
+    // GP22     = dummy / unused (A10 moved away)
+    // GP23..25 = A11..A13
     // GP26     = dummy (unusable)
     // GP27..34 = A14..A21
-    // GP35     = /RD dummy in sampled high window
+    // GP35     = /RD dummy in sampled window
     // GP36..37 = A22..A23
+    // GP38     = /ROMSEL (active-low diagnostic; AUTO-ROM matching uses safe address window)
+    // GP39     = /WRAMSEL (active-low qualifier)
+    // GP40     = A10
 
     uint32_t low_addr = (low18 >> 9) & 0x1ffu;  // A0..A8
 
-    // high17 bits:
-    // 0..4   -> A9..A13
-    // 5      -> GP26 dummy
-    // 6..13  -> A14..A21
-    // 14     -> GP35 /RD dummy
-    // 15..16 -> A22..A23
+    // high20 bit mapping (starting at GP21):
+    // bit0  = GP21 = A9
+    // bit1  = GP22 dummy
+    // bit2  = GP23 = A11
+    // bit3  = GP24 = A12
+    // bit4  = GP25 = A13
+    // bit5  = GP26 dummy
+    // bit6..13  = GP27..34 = A14..A21
+    // bit14 = GP35 /RD dummy
+    // bit15 = GP36 = A22
+    // bit16 = GP37 = A23
+    // bit17 = GP38 /ROMSEL diagnostic
+    // bit18 = GP39 /WRAMSEL (active-low qualifier)
+    // bit19 = GP40 = A10
+
     uint32_t high_addr =
-        ((high17 & 0x1fu) << 9) |
-        (((high17 >> 6) & 0xffu) << 14) |
-        (((high17 >> 15) & 0x1u) << 22) |
-        (((high17 >> 16) & 0x1u) << 23);
+        (((high20 >> 0) & 0x1u) << 9) |      // A9
+        (((high20 >> 19) & 0x1u) << 10) |    // A10 from GP40
+        (((high20 >> 2) & 0x7u) << 11) |     // A11..A13
+        (((high20 >> 6) & 0xffu) << 14) |    // A14..A21
+        (((high20 >> 15) & 0x1u) << 22) |    // A22
+        (((high20 >> 16) & 0x1u) << 23);     // A23
 
     return low_addr | high_addr;
 }
@@ -409,17 +510,18 @@ static void process_wram_port_read(uint32_t address, uint8_t data) {
         return;
     }
 
-    // Experimental: the read and write capture pipelines are buffered independently,
-    // so their software processing order is not guaranteed to be identical to bus order.
-    // We still expose the candidate and use it to improve the mirror, but DEBUG output
-    // labels it EXPERIMENTAL.  A future unified event stream can remove this caveat.
+    // v2.0 keeps WMDATA reads conservative/seed-only. The read/write capture pipelines
+    // are buffered independently, so a read must never "repair" a KNOWN byte
+    // with a potentially reordered/stale sample. $2180 remains a separate path,
+    // but obeys the same UNKNOWN-only seeding rule.
     uint32_t off = wmadd_shadow & 0x1ffffu;
-    wram[off] = data;
-    mark_wram_known(off);
+    bool seeded = seed_wram_if_unknown(off, data);
     ++total_wmdata_reconstructed_reads;
     uint32_t next = (off + 1u) & 0x1ffffu;
-    debug_wm_event("WMDATA READ  $%02X:2180 = %02X -> WRAM[%05lX], next=%05lX [EXPERIMENTAL ORDER]",
-                   bank, data, (unsigned long)off, (unsigned long)next);
+    debug_wm_event(
+        "WMDATA READ  $%02X:2180 = %02X -> WRAM[%05lX] %s, next=%05lX [WMDATA-SEED-ONLY]",
+        bank, data, (unsigned long)off, seeded ? "SEEDED" : "IGNORED_KNOWN",
+        (unsigned long)next);
     wmadd_shadow = next;
 }
 
@@ -453,6 +555,31 @@ static void command_banks(void) {
 
 static bool wram_byte_known(uint32_t offset) {
     return (wram_valid[offset >> 3] >> (offset & 7u)) & 1u;
+}
+
+static bool seed_wram_if_unknown(uint32_t offset, uint8_t data) {
+    if (wram_byte_known(offset)) return false;
+    wram[offset] = data;
+    mark_wram_known(offset);
+    return true;
+}
+
+// Return: 0=seeded UNKNOWN, 1=KNOWN and unchanged, 2=KNOWN and repaired.
+static int refresh_wram_from_read(uint32_t offset, uint8_t data) {
+    if (!wram_byte_known(offset)) {
+        wram[offset] = data;
+        mark_wram_known(offset);
+        return 0;
+    }
+    if (wram[offset] == data) return 1;
+    wram[offset] = data;
+    return 2;
+}
+
+static int cheese_slot(uint32_t offset) {
+    if (offset == CHEESE_OFF_A) return 0;
+    if (offset == CHEESE_OFF_B) return 1;
+    return -1;
 }
 
 static void mark_wram_known(uint32_t offset) {
@@ -507,17 +634,83 @@ static void print_help(void) {
     printf("  DEBUG OFF               stop debug output\n");
     printf("  BANKS                   show per-bank read/write counters\n");
     printf("  WMSTATE                 show $2180-$2183 pointer/counters\n");
+    printf("  WRAMSEL                 show /WRAMSEL + READ-REPAIR counters\n");
+    printf("  ROMFP                   binary safe-window cartridge-ROM fingerprint for AUTO-ROM bridge\n");
+    printf("  ROMFPCLEAR              clear captured ROM fingerprint samples\n");
+    printf("  CHEESE                  show legacy $1558/$155C targeted counters\n");
     printf("  PING                    reply PONG\n");
-    printf("Mirror source: observed WRAM reads+writes plus reconstructed CPU WMDATA ($2180) traffic.\n");
+    printf("Mirror source: /WRAMSEL-qualified writes + qualified A-bus READ-REPAIR + conservative WMDATA ($2180).\n");
     printf("DEBUG is diagnostic only: use it in PuTTY with the Python RA bridge closed.\n");
+}
+
+static void command_wramsel(void) {
+    printf("WRAMSEL write_ok=%llu write_reject=%llu read_seed=%llu read_same=%llu read_repair=%llu read_ignored=%llu known=%lu/%u\n",
+           (unsigned long long)total_wramsel_write_ok,
+           (unsigned long long)total_wramsel_write_reject,
+           (unsigned long long)total_wramsel_read_seed,
+           (unsigned long long)total_wramsel_read_same,
+           (unsigned long long)total_wramsel_read_repair,
+           (unsigned long long)total_wramsel_read_ignored,
+           (unsigned long)known_wram_bytes,
+           (unsigned)WRAM_SIZE);
+}
+
+static void command_cheese(void) {
+    bool ka = wram_byte_known(CHEESE_OFF_A);
+    bool kb = wram_byte_known(CHEESE_OFF_B);
+    printf("CHEESE A=%02X A_known=%u A_w=%llu A_r=%llu A_repair=%llu "
+           "B=%02X B_known=%u B_w=%llu B_r=%llu B_repair=%llu\n",
+           ka ? wram[CHEESE_OFF_A] : 0u, ka ? 1u : 0u,
+           (unsigned long long)cheese_write_seen[0],
+           (unsigned long long)cheese_read_seen[0],
+           (unsigned long long)cheese_repair_seen[0],
+           kb ? wram[CHEESE_OFF_B] : 0u, kb ? 1u : 0u,
+           (unsigned long long)cheese_write_seen[1],
+           (unsigned long long)cheese_read_seen[1],
+           (unsigned long long)cheese_repair_seen[1]);
+}
+
+static void command_romfp(void) {
+    // Binary record format (4 bytes each): addr_lo, addr_mid, addr_hi, data.
+    // Addresses are physical SNES A-bus addresses observed in the v2.2 safe ROM window.
+    printf("ROMFP2 %lu %llu %llu %llu\n",
+           (unsigned long)romfp_count,
+           (unsigned long long)total_rom_window_reads,
+           (unsigned long long)total_rom_window_romsel_low,
+           (unsigned long long)total_romsel_reads);
+    fflush(stdout);
+
+    uint8_t rec[4];
+    for (uint32_t i = 0; i < romfp_count; ++i) {
+        uint32_t a = romfp_addr[i] & 0x00ffffffu;
+        rec[0] = (uint8_t)(a & 0xffu);
+        rec[1] = (uint8_t)((a >> 8) & 0xffu);
+        rec[2] = (uint8_t)((a >> 16) & 0xffu);
+        rec[3] = romfp_data[i];
+        stdio_put_string((const char *)rec, 4, false, false);
+    }
+    stdio_flush();
+    printf("\nEND ROMFP2\n");
+    fflush(stdout);
+}
+
+static void command_romfp_clear(void) {
+    romfp_count = 0;
+    total_romsel_reads = 0;
+    total_rom_window_reads = 0;
+    total_rom_window_romsel_low = 0;
+    romfp_last_addr = 0xffffffffu;
+    romfp_last_data = 0u;
+    printf("OK ROMFP cleared\n");
 }
 
 static void print_info(void) {
     printf("INFO batches=%lu bus_writes=%llu wram_writes=%llu direct_w=%llu mirror_w=%llu "
            "bus_reads=%llu wram_reads=%llu direct_r=%llu mirror_r=%llu "
+           "write_ok=%llu write_reject=%llu read_seed=%llu read_same=%llu read_repair=%llu read_ignored=%llu "
            "wmaddr_w=%llu wmdata_w=%llu wmdata_r=%llu wm_recon_w=%llu wm_recon_r=%llu "
            "wm_unknown=%llu snap_count=%llu snap_ranges=%lu snap_bytes=%lu snap_unknown=%lu "
-           "known=%lu/%u (%.2f%%)\n",
+           "romsel_reads=%llu romwin_reads=%llu romwin_romsel_low=%llu romfp=%lu/%u known=%lu/%u (%.2f%%)\n",
            (unsigned long)completed_batches,
            (unsigned long long)total_bus_writes,
            (unsigned long long)total_wram_writes,
@@ -527,6 +720,12 @@ static void print_info(void) {
            (unsigned long long)total_wram_reads,
            (unsigned long long)total_direct_reads,
            (unsigned long long)total_mirror_reads,
+           (unsigned long long)total_wramsel_write_ok,
+           (unsigned long long)total_wramsel_write_reject,
+           (unsigned long long)total_wramsel_read_seed,
+           (unsigned long long)total_wramsel_read_same,
+           (unsigned long long)total_wramsel_read_repair,
+           (unsigned long long)total_wramsel_read_ignored,
            (unsigned long long)total_wmaddr_reg_writes,
            (unsigned long long)total_wmdata_writes,
            (unsigned long long)total_wmdata_reads,
@@ -537,6 +736,11 @@ static void print_info(void) {
            (unsigned long)last_snapshot_ranges,
            (unsigned long)last_snapshot_bytes,
            (unsigned long)last_snapshot_unknown,
+           (unsigned long long)total_romsel_reads,
+           (unsigned long long)total_rom_window_reads,
+           (unsigned long long)total_rom_window_romsel_low,
+           (unsigned long)romfp_count,
+           (unsigned)ROMFP_MAX_RECORDS,
            (unsigned long)known_wram_bytes,
            (unsigned)WRAM_SIZE,
            (double)known_wram_bytes * 100.0 / (double)WRAM_SIZE);
@@ -829,6 +1033,14 @@ static void execute_command(char *line) {
         command_banks();
     } else if (!strcmp(cmd, "WMSTATE")) {
         command_wmstate();
+    } else if (!strcmp(cmd, "WRAMSEL")) {
+        command_wramsel();
+    } else if (!strcmp(cmd, "ROMFP")) {
+        command_romfp();
+    } else if (!strcmp(cmd, "ROMFPCLEAR")) {
+        command_romfp_clear();
+    } else if (!strcmp(cmd, "CHEESE")) {
+        command_cheese();
     } else {
         printf("ERR unknown command '%s' (type HELP)\n", cmd);
     }
@@ -865,9 +1077,9 @@ static void process_write_batch(const uint32_t *low_buf, const uint32_t *high_bu
 
     for (int i = 0; i < SAMPLE_COUNT; ++i) {
         uint32_t low18 = unpack_low18(low_buf[i]);
-        uint32_t high17 = unpack_high17(high_buf[i]);
+        uint32_t high20 = unpack_high20(high_buf[i]);
         uint8_t data = reconstruct_data(low18);
-        uint32_t address = reconstruct_address(low18, high17) & 0xffffffu;
+        uint32_t address = reconstruct_address(low18, high20) & 0xffffffu;
         uint8_t bank = (uint8_t)(address >> 16);
 
         ++total_bus_writes;
@@ -883,25 +1095,39 @@ static void process_write_batch(const uint32_t *low_buf, const uint32_t *high_bu
         maybe_debug_access(false, address, data, is_wram, wram_offset, direct);
         if (!is_wram) continue;
 
+        // v1.8 WRAMSEL: address decoding alone is not enough. Accept a WRAM
+        // write only when the SNES also asserts /WRAMSEL (active low).
+        if (!sampled_wramsel_active(high20)) {
+            ++total_wramsel_write_reject;
+            continue;
+        }
+
+        ++total_wramsel_write_ok;
         ++total_wram_writes;
         if (direct) ++total_direct_writes;
         else ++total_mirror_writes;
 
         wram[wram_offset] = data;
         mark_wram_known(wram_offset);
+        int cslot = cheese_slot(wram_offset);
+        if (cslot >= 0) ++cheese_write_seen[cslot];
     }
 }
 
 static void process_read_batch(const uint32_t *low_buf, const uint32_t *high_buf) {
     for (int i = 0; i < SAMPLE_COUNT; ++i) {
         uint32_t low18 = unpack_low18(low_buf[i]);
-        uint32_t high17 = unpack_high17(high_buf[i]);
+        uint32_t high20 = unpack_high20(high_buf[i]);
         uint8_t data = reconstruct_data(low18);
-        uint32_t address = reconstruct_address(low18, high17) & 0xffffffu;
+        uint32_t address = reconstruct_address(low18, high20) & 0xffffffu;
         uint8_t bank = (uint8_t)(address >> 16);
 
         ++total_bus_reads;
         ++bank_read_counts[bank];
+
+        // v2.2 AUTO-ROM SAFE-WINDOW: collect real cartridge ROM reads in parallel with WRAM capture.
+        // This is intentionally passive and does not alter the proven v2.0 WRAM path.
+        record_rom_fingerprint(address, data, high20);
 
         process_wram_port_read(address, data);
 
@@ -911,14 +1137,30 @@ static void process_read_batch(const uint32_t *low_buf, const uint32_t *high_buf
         maybe_debug_access(true, address, data, is_wram, wram_offset, direct);
         if (!is_wram) continue;
 
+        // The read state machine is already triggered by /RD=LOW. v2.0 keeps
+        // /WRAMSEL=LOW as the second qualifier. Qualified reads can repair stale bytes.
+        if (!sampled_wramsel_active(high20)) {
+            ++total_wramsel_read_ignored;
+            continue;
+        }
+
         ++total_wram_reads;
         if (direct) ++total_direct_reads;
         else ++total_mirror_reads;
 
-        // A read gives us the actual byte currently present in WRAM, so it can
-        // initialise an UNKNOWN byte and repair a stale value if a write was missed.
-        wram[wram_offset] = data;
-        mark_wram_known(wram_offset);
+        // v2.0 READ-REPAIR: a qualified physical WRAM read is an observation
+        // of the current byte. It may seed UNKNOWN memory or repair a stale
+        // KNOWN value left behind when a write sample was missed.
+        int refresh = refresh_wram_from_read(wram_offset, data);
+        if (refresh == 0) ++total_wramsel_read_seed;
+        else if (refresh == 1) ++total_wramsel_read_same;
+        else ++total_wramsel_read_repair;
+
+        int cslot = cheese_slot(wram_offset);
+        if (cslot >= 0) {
+            ++cheese_read_seen[cslot];
+            if (refresh == 2) ++cheese_repair_seen[cslot];
+        }
     }
 }
 
@@ -933,20 +1175,17 @@ int main(void) {
     memset(wram, 0, sizeof(wram));
     memset(wram_valid, 0, sizeof(wram_valid));
 
-    printf("\n=== SNES RP2350B RA Firmware v1.6O3 ORDERED / SKIP GP5+GP26 ===\n");
-    printf("Passive A-bus monitor with ordered wiring, GP5+GP26 skipped + atomic RA snapshots.\n");
-    printf("PHI2=GP0 /WR=GP1; D0-D2=GP2-4; GP5=SKIP; D3-D7=GP6-10.
-");
-    printf("ORDERED map: A0..A8=GP11..19; GP20 skipped; A9..A13=GP21..25.
-");
-    printf("             GP26 skipped; A14..A21=GP27..34; /RD=GP35.
-");
-    printf("             A22=GP36 A23=GP37 /ROMSEL=GP38 /WRAMSEL=GP39 optional.
-");
-    printf("Type HELP for commands; SNAP is used by the v1.3 RA bridge for coherent reads.\n\n");
+    printf("\n=== SNES RP2350B RA Firmware v2.2 WRAMSEL + READ-REPAIR + AUTO-ROM SAFE-WINDOW ===\n");
+    printf("Passive A-bus monitor: /WRAMSEL-qualified WRAM + safe-window ROM fingerprint.\n");
+    printf("PHI2=GP0 /WR=GP1; D0-D2=GP2-4; GP5=SKIP; D3-D7=GP6-10.\n");
+    printf("A0..A8=GP11..19; GP20=SKIP; A9=GP21; GP22=SKIP; A10=GP40.\n");
+    printf("A11..A13=GP23..25; GP26=SKIP; A14..A21=GP27..34; /RD=GP35.\n");
+    printf("A22=GP36 A23=GP37 /ROMSEL=GP38 /WRAMSEL=GP39.\n");
+    printf("GP38=/ROMSEL is diagnostic; AUTO-ROM uses the safe ROM address window. GP39=/WRAMSEL remains active; GP40=A10.\n");
+    printf("Type HELP for commands; CHEESE probes $1558/$155C; SNAP provides coherent RA reads.\n\n");
     fflush(stdout);
 
-    for (uint pin = 0; pin <= 39; ++pin) {
+    for (uint pin = 0; pin <= 40; ++pin) {
         configure_input(
             pin,
             pin == PIN_WR || pin == PIN_RD ||
@@ -971,14 +1210,15 @@ int main(void) {
     sm_config_set_fifo_join(&c_lo, PIO_FIFO_JOIN_RX);
     int init_lo_rc = pio_sm_init(pio_lo, sm_lo, off_lo, &c_lo);
 
-    // ---------- PIO1: high GPIO window GP21..GP37 ----------
-    // GP26 is ignored; GP35 is /RD; GP36..37 carry A22..A23.
+    // ---------- PIO1: high GPIO window GP21..GP40 ----------
+    // GP22, GP26 and GP35 are ignored for address reconstruction. GP38=/ROMSEL is diagnostic; GP39=/WRAMSEL qualifies WRAM.
+    // GP40 now carries A10.
     PIO pio_hi = pio1;
     const uint sm_hi = 0;
     int base_hi_rc = pio_set_gpio_base(pio_hi, 16);
 
-    for (uint pin = 21; pin <= 37; ++pin) pio_gpio_init(pio_hi, pin);
-    pio_sm_set_consecutive_pindirs(pio_hi, sm_hi, 21, 17, false);
+    for (uint pin = 21; pin <= 40; ++pin) pio_gpio_init(pio_hi, pin);
+    pio_sm_set_consecutive_pindirs(pio_hi, sm_hi, 21, 20, false);
 
     uint off_hi = pio_add_program(pio_hi, &snes_capture_high_program);
     pio_sm_config c_hi = snes_capture_high_program_get_default_config(off_hi);
@@ -1006,7 +1246,7 @@ int main(void) {
     sm_config_set_fifo_join(&c_read_lo, PIO_FIFO_JOIN_RX);
     int init_read_lo_rc = pio_sm_init(pio_lo, sm_read_lo, off_read_lo, &c_read_lo);
 
-    // ---------- PIO1 SM1: GP21..GP37 high window on reads ----------
+    // ---------- PIO1 SM1: GP21..GP40 high window on reads ----------
     const uint sm_read_hi = 1;
     uint off_read_hi = pio_add_program(pio_hi, &snes_capture_read_high_program);
     pio_sm_config c_read_hi = snes_capture_read_high_program_get_default_config(off_read_hi);
@@ -1058,8 +1298,8 @@ int main(void) {
     channel_config_set_write_increment(&dc_read_hi, true);
     channel_config_set_dreq(&dc_read_hi, pio_get_dreq(pio_hi, sm_read_hi, false));
 
-    printf("READY. Read+write capture uses v1.6 double buffers with immediate DMA rearm.\n");
-    printf("Use INFO, BANKS, WMSTATE, DEBUG, READ, READSNES, HEX, DUMPBIN, RBIN or SNAP.\n\n");
+    printf("READY. v2.2 keeps READ-REPAIR and uses SAFE-WINDOW AUTO-ROM fingerprint capture.\n");
+    printf("Use INFO, WRAMSEL, ROMFP, ROMFPCLEAR, CHEESE, BANKS, WMSTATE, DEBUG, READ, READSNES, HEX, DUMPBIN, RBIN or SNAP.\n\n");
     fflush(stdout);
 
     // Start both capture pipelines. Each pipeline is independently rearmed when its

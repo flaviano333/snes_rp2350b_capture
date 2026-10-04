@@ -1,0 +1,22 @@
+SNES RP2350B RA v2.1 - PINOUT (sem mudanca de fiacao em relacao a v2.0)
+
+GP0  = PHI2
+GP1  = /WR
+GP2-4 = D0-D2
+GP5 = SKIP
+GP6-10 = D3-D7
+GP11-19 = A0-A8
+GP20 = SKIP
+GP21 = A9
+GP22 = SKIP
+GP23-25 = A11-A13
+GP26 = SKIP
+GP27-34 = A14-A21
+GP35 = /RD
+GP36 = A22
+GP37 = A23
+GP38 = /ROMSEL  (ATIVO na v2.1: fingerprint AUTO-ROM)
+GP39 = /WRAMSEL (ATIVO: qualificacao WRAM)
+GP40 = A10
+
+A v2.1 nao exige nenhuma mudanca fisica em relacao a v2.0.

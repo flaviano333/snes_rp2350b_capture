@@ -1,0 +1,12 @@
+SNES RA v2.2 - AUTO-ROM SAFE-WINDOW
+
+- Corrige a baixa correspondencia (~1,5%) observada na v2.1.
+- Fingerprint deixa de depender de /ROMSEL no instante exato da amostra.
+- Coleta somente janela universal de ROM: $00-$3F/$80-$BF:$8000-$FFFF.
+- GP38=/ROMSEL continua contado para diagnostico.
+- ROMFP2 inclui contadores de janela e /ROMSEL.
+- Bridge testa lag -3..+3 entre endereco e dado para compensar pequeno skew PIO/DMA.
+- Nenhum matching e executado antes de haver amostras suficientes.
+- Falhas de AUTO-ROM agora terminam com mensagem limpa, sem traceback.
+- Timeout de coleta e protecao contra fingerprint cheio com pouca diversidade.
+- WRAMSEL + READ-REPAIR + HYBRID-POLL preservados.

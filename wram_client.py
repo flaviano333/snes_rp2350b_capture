@@ -146,7 +146,7 @@ def cmd_snap(port, ranges):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="SNES RP2350B WRAM Bridge v1.3 client")
+    ap = argparse.ArgumentParser(description="SNES RP2350B WRAM Bridge v1.8 client")
     ap.add_argument("port", help="serial port, e.g. COM7 or /dev/ttyACM0")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
@@ -154,6 +154,7 @@ def main():
     sub.add_parser("help")
     sub.add_parser("ping")
     sub.add_parser("clear")
+    sub.add_parser("wramsel")
 
     p_read = sub.add_parser("read")
     p_read.add_argument("offset", help="canonical WRAM offset in hex, e.g. 013FB")
@@ -181,6 +182,8 @@ def main():
         cmd_simple(args.port, "PING")
     elif args.cmd == "clear":
         cmd_simple(args.port, "CLEAR")
+    elif args.cmd == "wramsel":
+        cmd_simple(args.port, "WRAMSEL")
     elif args.cmd == "read":
         cmd_simple(args.port, f"READ {args.offset}")
     elif args.cmd == "read-snes":

@@ -1,0 +1,19 @@
+SNES RA v2.1 - AUTO-ROM
+
+Base: v2.0 WRAMSEL + READ-REPAIR, mantida sem alterar a politica de WRAM.
+
+NOVO
+- GP38=/ROMSEL agora e usado passivamente para formar uma impressao digital do cartucho.
+- Firmware guarda ate 1024 observacoes endereco+byte de leituras reais de ROM.
+- Comando ROMFP envia o fingerprint ao bridge; ROMFPCLEAR reinicia a coleta.
+- Bridge procura referencias .sfc/.smc recursivamente na pasta ROMs.
+- Deteccao testa LoROM, HiROM e ExHiROM e aceita header de copier de 512 bytes.
+- A selecao exige score >= 90%, pelo menos 40 matches e margem de seguranca.
+- Se houver ambiguidade, o bridge NAO escolhe automaticamente um arquivo errado.
+- --rom continua disponivel como override manual.
+
+IMPORTANTE
+- AUTO-ROM exige firmware v2.1 (reflash).
+- GP38 ja fazia parte da fiacao/amostragem; nao ha mudanca de fio em relacao a v2.0.
+- A ROM selecionada e somente a referencia apresentada ao RA2Snes.
+- A memoria de conquistas continua vindo do espelho WRAM fisico com READ-REPAIR.

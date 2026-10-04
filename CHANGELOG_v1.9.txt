@@ -1,0 +1,12 @@
+SNES RA v1.9 WRAMSEL + HYBRID-POLL
+
+Correcao principal:
+- A v1.8 dependia de um gap >8 ms entre ciclos GetAddress. Se RA2Snes fizesse
+  polling continuo sem esse silencio, o snapshot podia ficar congelado para sempre.
+- v1.9 abre novo snapshot por tres criterios complementares:
+  1. gap > --poll-gap-ms;
+  2. repeticao da assinatura que iniciou o ciclo atual;
+  3. idade do snapshot > --max-snapshot-age-ms (fail-safe).
+- O diagnostico imprime reason=FIRST/GAP/REPEAT/AGE para mostrar por que cada
+  snapshot foi atualizado.
+- Firmware v1.8 WRAMSEL e pinagem permanecem inalterados. NAO REFLASHAR.

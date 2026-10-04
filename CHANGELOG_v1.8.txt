@@ -1,0 +1,21 @@
+v1.8 WRAMSEL + TIMED-POLL
+=========================
+FIRMWARE
+- GP39 /WRAMSEL ativo para qualificar WRAM.
+- Write: so altera espelho se /WRAMSEL=LOW.
+- Read: /RD=LOW + /WRAMSEL=LOW e somente UNKNOWN -> KNOWN.
+- Read nunca sobrescreve KNOWN.
+- WMDATA $2180 read tambem passa a seed-only.
+- Novo comando WRAMSEL com write_ok/write_reject/read_seed/read_ignored/known.
+- INFO inclui os mesmos contadores.
+- Nenhuma mudanca de pinagem; A10 continua no GP40.
+
+BRIDGE
+- Remove heuristica v1.7 por assinatura repetida.
+- Novo boundary temporal: gap GetAddress > 8 ms (ajustavel).
+- Gap inicia depois da resposta GetAddress anterior.
+- SNAP e criado uma vez no inicio do poll; grupos do burst compartilham a imagem.
+- Range novo dentro do burst nao forca snapshot no meio do poll; entra no proximo.
+- Info nao dispara SNAP.
+- --trace-polls e --trace-wramsel adicionados.
+- Bridge recusa iniciar se firmware v1.8 WRAMSEL nao for detectado.

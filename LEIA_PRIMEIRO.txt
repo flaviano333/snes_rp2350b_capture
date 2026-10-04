@@ -1,32 +1,48 @@
-SNES RP2350B RA UNIVERSAL v1.6O3
-GP5 + GP26 IGNORADOS
-=================================
+SNES RA v2.2 - AUTO-ROM SAFE-WINDOW + WRAMSEL + READ-REPAIR
 
-Esta revisao foi feita para a sua placa RP2350B com:
-- GP5 inutilizado;
-- GP26 inutilizado;
-- GP20 mantido livre por causa do RGB onboard.
+OBJETIVO
+Identificar automaticamente o cartucho usando as ROMs colocadas em ROMs\, sem
+precisar informar --rom. A logica de WRAM da v2.0 permanece intacta.
 
-A estrategia de captura permanece baseada na v1.6 continuous double-buffer.
+O QUE MUDOU EM RELACAO A v2.1
+A v2.1 dependia do estado de GP38=/ROMSEL no instante exato da amostra. No teste
+real isso produziu apenas ~1,5% de coincidencia, praticamente aleatorio.
 
-NOVO MAPA:
-GP0       PHI2
-GP1       /WR
-GP2-4     D0-D2
-GP5       PULAR
-GP6-10    D3-D7
-GP11-19   A0-A8
-GP20      PULAR
-GP21-25   A9-A13
-GP26      PULAR
-GP27-34   A14-A21
-GP35      /RD
-GP36      A22
-GP37      A23
-GP38      /ROMSEL
-GP39      /WRAMSEL opcional/reservado
+A v2.2 usa como fingerprint apenas leituras em uma janela conservadora que e ROM
+tanto em LoROM quanto em HiROM: bancos $00-$3F e $80-$BF, enderecos $8000-$FFFF.
+GP38=/ROMSEL continua sendo medido e aparece no diagnostico, mas nao decide mais
+se uma amostra entra no fingerprint.
 
-Consulte PINOUT_ORDENADO_SKIP_GP5_GP26.txt antes de soldar.
+O bridge tambem testa lag de -3 a +3 amostras entre endereco e dado. Isso permite
+recuperar uma pequena defasagem constante entre as duas pipelines PIO/DMA sem
+aceitar uma ROM de baixa confianca.
 
-Esta continua sendo a firmware UNIVERSAL 1:1:
-sem traducao especifica de Tom & Jerry e sem shim de conquistas.
+COMO USAR
+1. Compile/grave o firmware v2.2 no RP2350B. EXIGE REFLASH.
+2. Nao altere a fiacao: GP38=/ROMSEL, GP39=/WRAMSEL, GP40=A10.
+3. Coloque as referencias .sfc/.smc na pasta ROMs (subpastas sao aceitas).
+4. Ligue RP2350B e SNES com o cartucho.
+5. Execute INICIAR_RA_v2.2.bat.
+6. A deteccao deve mostrar algo parecido com:
+
+   AUTO-ROM candidate: Tom and Jerry (USA).sfc [LOROM] lag=+0 300/305 = 98.4%
+   AUTO-ROM DETECTED: Tom and Jerry (USA).sfc ...
+
+Se nenhuma ROM atingir a confianca minima, o bridge NAO inicia com um candidato
+incerto. Ele mostra um erro limpo e os melhores candidatos.
+
+MODO DIAGNOSTICO
+Use INICIAR_RA_v2.2_DIAGNOSTICO.bat. Durante a coleta, observe:
+
+   /ROMSEL low in X/Y window reads
+
+Isso serve para avaliar GP38 separadamente da identificacao.
+
+MODO MANUAL (FALLBACK)
+py -3 .\ra_usb2snes_bridge.py --port COM7 --rom "C:\caminho\jogo.sfc"
+
+IMPORTANTE
+- Nao rode QUsb2Snes ao mesmo tempo.
+- A ROM da pasta serve somente para identificacao pelo RA2Snes.
+- A memoria de conquistas continua vindo do SNES fisico.
+- A logica /WRAMSEL + READ-REPAIR da v2.0 foi preservada.

@@ -1,0 +1,23 @@
+SNES RA v2.0 - WRAMSEL + READ-REPAIR + CHEESE-PROBE
+
+Problema atacado
+- v1.8/v1.9 mantinham bytes KNOWN imutaveis em leituras.
+- Se uma escrita de contador fosse perdida, o espelho podia ficar velho para sempre.
+
+Mudancas
+- /WRAMSEL em GP39 continua qualificando acessos A-bus de WRAM.
+- Escritas qualificadas continuam atualizando o espelho imediatamente.
+- Leituras A-bus qualificadas agora fazem READ-REPAIR:
+  * UNKNOWN -> seed
+  * KNOWN igual -> confirma
+  * KNOWN diferente -> repara o espelho
+- WMDATA $2180 permanece conservador/seed-only por causa do ponteiro reconstruido.
+- Comando CHEESE monitora offsets 01558 e 0155C.
+- Bridge informa quando o RA realmente solicita esses bytes.
+- HYBRID-POLL da v1.9 foi mantido.
+
+Tom and Jerry (USA)
+- 99 decimal = 0x63.
+- Codigos Action Replay conhecidos de 99 Cheese Bits usam $7E:1558 e $7E:155C.
+
+Este pacote EXIGE REFLASH do firmware v2.0.
