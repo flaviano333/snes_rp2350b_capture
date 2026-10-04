@@ -63,3 +63,6 @@ Caso uma ROM de referência seja necessária para identificação pelo RetroAchi
 ## Aviso
 
 Este é um projeto experimental, feito com auxilio de inteligência artificial e pode exigir ajustes dependendo da revisão do console, cartucho e configuração utilizada.
+
+## Vídeos
+https://www.youtube.com/watch?v=As4oQfH6M9g&t=113s
